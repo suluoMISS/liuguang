@@ -304,6 +304,8 @@ fn run(cli: Cli) -> Result<(), String> {
             let mut config = if config_path.exists() {
                 Config::load(&config_path)
                     .map_err(|e| format!("配置无效（{}）: {e}", config_path.display()))?
+            } else if persona == Persona::User {
+                bootstrap_user_config(&config_path)
             } else {
                 tracing::warn!(
                     path = %config_path.display(),
@@ -328,4 +330,103 @@ fn run(cli: Cli) -> Result<(), String> {
             })
         }
     }
+}
+
+/// 解析桌面模式默认媒体目录（优先 `$XDG_PICTURES_DIR/Wallpapers`，回退 `$HOME/Pictures/Wallpapers`）。
+fn default_user_wallpapers_dir() -> Option<PathBuf> {
+    if let Some(pics) = std::env::var_os("XDG_PICTURES_DIR") {
+        let p = PathBuf::from(&pics);
+        if p.is_absolute() {
+            return Some(p.join("Wallpapers"));
+        }
+    }
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(|h| PathBuf::from(h).join("Pictures").join("Wallpapers"))
+}
+
+/// 解析桌面模式候选现有目录（用于 `ProtectHome=read-only` 下无法新建目录时的回退）。
+fn fallback_existing_user_dir() -> Option<PathBuf> {
+    if let Some(pics) = std::env::var_os("XDG_PICTURES_DIR") {
+        let p = PathBuf::from(&pics);
+        if p.is_absolute() && p.is_dir() {
+            return Some(p);
+        }
+    }
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)?;
+    for rel in ["Pictures", "图片", "Videos", "视频"] {
+        let candidate = home.join(rel);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    home.is_dir().then_some(home)
+}
+
+/// 桌面首次运行引导：配置文件尚不存在时自动建立默认壁纸库与配置目录，免去手工建文件和写 TOML。
+fn bootstrap_user_config(config_path: &std::path::Path) -> Config {
+    let mut cfg = Config::default();
+    cfg.display.backend = DisplayBackendKind::Auto;
+    cfg.apply_persona_defaults(Persona::User);
+
+    let cache_dir = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join(".cache"))
+        });
+    if let Some(cache) = cache_dir {
+        let _ = std::fs::create_dir_all(cache.join("liuguang"));
+    }
+
+    if let Some(media_dir) = default_user_wallpapers_dir() {
+        let _ = std::fs::create_dir_all(&media_dir);
+        if media_dir.is_dir() {
+            cfg.slideshow.directory = media_dir.clone();
+            cfg.library = Some(liuguang_core::library::LibraryConfig {
+                root: media_dir.clone(),
+                image_dirs: vec![media_dir.clone()],
+                video_dirs: vec![media_dir],
+                recursive: true,
+                ..Default::default()
+            });
+        } else if let Some(existing) = fallback_existing_user_dir() {
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let is_home_root = home.as_ref().is_some_and(|h| h == &existing);
+            cfg.slideshow.directory = existing.clone();
+            cfg.library = Some(liuguang_core::library::LibraryConfig {
+                root: existing.clone(),
+                image_dirs: if is_home_root {
+                    Vec::new()
+                } else {
+                    vec![existing.clone()]
+                },
+                video_dirs: if is_home_root {
+                    Vec::new()
+                } else {
+                    vec![existing]
+                },
+                recursive: !is_home_root,
+                ..Default::default()
+            });
+        }
+    }
+
+    match cfg.save_atomic(config_path) {
+        Ok(bytes) => tracing::info!(
+            path = %config_path.display(),
+            bytes,
+            "首次启动桌面模式：已自动生成默认配置文件"
+        ),
+        Err(e) => tracing::warn!(
+            path = %config_path.display(),
+            error = %e,
+            "首次启动生成默认配置文件失败，暂以内存默认配置运行"
+        ),
+    }
+    cfg
 }

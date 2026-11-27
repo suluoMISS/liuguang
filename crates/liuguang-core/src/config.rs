@@ -1223,15 +1223,18 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
     use std::io::Write as _;
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = dir.unwrap_or_else(|| Path::new("."));
+    let io_err = |source: std::io::Error| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    if !dir.exists() {
+        std::fs::create_dir_all(dir).map_err(io_err)?;
+    }
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "config.toml".to_string());
     let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
-    let io_err = |source: std::io::Error| ConfigError::Io {
-        path: path.to_path_buf(),
-        source,
-    };
     let write = || -> std::io::Result<()> {
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(bytes)?;
@@ -1929,5 +1932,19 @@ vsync = false
         pl.on_video_end = "loop".into();
         assert_eq!(pl.playback_mode(), PlaybackMode::SingleLoop);
         assert!(!pl.playback_mode().advances_on_video_end());
+    }
+
+    #[test]
+    fn save_atomic_creates_missing_parent_directory() {
+        let dir = std::env::temp_dir().join(format!("liuguang-save-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg_path = dir.join("nested").join("liuguang").join("config.toml");
+        let cfg = Config::default();
+        let bytes = cfg
+            .save_atomic(&cfg_path)
+            .expect("missing parent dir should be created automatically");
+        assert!(bytes > 0);
+        assert!(cfg_path.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

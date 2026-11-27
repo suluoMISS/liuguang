@@ -64,8 +64,8 @@ for script in install.sh install-user-session.sh build-gui.sh gen-outputs-config
     [ -e "$ROOT/scripts/$script" ] || { echo "[rpm-build] 缺少 scripts/$script" >&2; exit 1; }
     cp -a "$ROOT/scripts/$script" "$PKGDIR/scripts/"
 done
-# 内部归档与旧版 npm 目录不属于源码包
-rm -rf "$PKGDIR/packaging/npm" "$PKGDIR/docs/archive"
+# 无需打入源码包的目录不随 tarball 分发
+true
 # 构建产物不属于源码包：GUI 是独立 workspace，apps/liuguang-gui/target 可达数百 MB
 find "$PKGDIR" -depth -type d -name target -prune -exec rm -rf {} +
 

@@ -72,7 +72,17 @@
 
 ## 快速开始
 
-### 1. 环境体检与一键安装
+### 1. 直接下载预编译安装包（推荐，无需编译）
+
+前往 **[GitHub Releases](https://github.com/suluoMISS/liuguang/releases/latest)** 下载对应发行版包（Arch `.pkg.tar.zst`、Debian/Ubuntu `.deb`、Fedora/RHEL `.rpm` 或通用二进制包）：
+
+- **Arch Linux**（内置 `vaapi` 零拷贝）：`sudo pacman -U liuguang-*.pkg.tar.zst liuguang-gui-*.pkg.tar.zst`
+- **Debian / Ubuntu**：`sudo apt install ./liuguang_*.deb ./liuguangctl_*.deb ./liuguang-gui_*.deb`
+- **Fedora / RHEL**：`sudo dnf install ./liuguang-*.rpm ./liuguangctl-*.rpm ./liuguang-gui-*.rpm`
+
+安装后直接从应用菜单启动 **流光（`liuguang-gui`）**，首次打开如提示后台未运行，点界面里的 **「一键启动并启用服务」** 即可自动初始化配置与媒体库。
+
+### 2. 环境体检与一键安装脚本
 
 安装脚本自带只读体检与显式权限请求（需要提权时说明原因并调用 `sudo` / `pkexec`）：
 
@@ -84,27 +94,22 @@
 
 > 首次在桌面安装若 `/dev/dri/renderD*` 缺少读取权限，脚本会提示并将当前用户加入 `video,render` 组；`liuguang-user.service` 已配置 `CacheDirectory=liuguang`，首次启动自动授权写入缩略图与转码缓存。
 
-### 2. Arch Linux 打包安装
-
-```bash
-(cd packaging/arch     && makepkg -f)
-(cd packaging/arch/gui && makepkg -f)
-
-sudo pacman -U dist/arch/liuguang-*.pkg.tar.zst dist/arch/liuguang-gui-*.pkg.tar.zst
-
-# 桌面用户开启用户服务：
-./scripts/install.sh --mode user
-```
-
-### 3. 从源码构建
+### 3. 从源码构建（及国内 crates.io 加速）
 
 需要 Rust **1.85+**（edition 2024）、Wayland/DRM/GStreamer 开发包，以及可选的 `ffmpeg`/`libva`（零拷贝视频）和 `gtk4`/`libadwaita`（图形界面）：
+
+> 国内网络若 `cargo` 拉取 crates.io 较慢，可先配置 `rsproxy.cn` 镜像（新建 `~/.cargo/config.toml` 写入 `crates-io` 替换源 `https://rsproxy.cn/crates.io-index`）。
 
 ```bash
 git clone https://github.com/suluoMISS/liuguang.git
 cd liuguang
 
-# 守护进程 + 控制端 CLI/TUI（启用 VA-API 零拷贝）
+# Arch Linux 本地打包（推荐，打包环境自动启用 vaapi）
+(cd packaging/arch     && makepkg -f)
+(cd packaging/arch/gui && makepkg -f)
+sudo pacman -U dist/arch/liuguang-*.pkg.tar.zst dist/arch/liuguang-gui-*.pkg.tar.zst
+
+# 或者直接编译守护进程 + 控制端 CLI/TUI（启用 VA-API 零拷贝）
 cargo build --release -p liuguang -p liuguangctl --features liuguang/vaapi
 
 # GTK4 图形界面（独立 workspace，避免无桌面的服务器安装 GTK 依赖）

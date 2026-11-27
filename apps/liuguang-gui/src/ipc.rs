@@ -696,8 +696,12 @@ fn handle(client: &mut IpcClient, config_path: &Path, cmd: Cmd) -> Result<Upd, I
                 )
                 .map_err(|e| IpcErr::Transport(e.to_string()))?;
             let result: AddSourceResult = parse(resp, "媒体来源")?;
+            let save_resp = client
+                .request(Method::SaveConfig, json!({}))
+                .map_err(|e| IpcErr::Transport(e.to_string()))?;
+            into_result(save_resp)?;
             Ok(Upd::Notice(if result.created {
-                format!("已添加来源 {}", result.source_id)
+                format!("已添加并保存来源 {}", result.source_id)
             } else {
                 format!("来源已存在：{}", result.source_id)
             }))
@@ -707,7 +711,11 @@ fn handle(client: &mut IpcClient, config_path: &Path, cmd: Cmd) -> Result<Upd, I
                 .request(Method::RemoveSource, json!({"source_id": source_id}))
                 .map_err(|e| IpcErr::Transport(e.to_string()))?;
             into_result(resp)?;
-            Ok(Upd::Notice(format!("已移除来源 {source_id}")))
+            let save_resp = client
+                .request(Method::SaveConfig, json!({}))
+                .map_err(|e| IpcErr::Transport(e.to_string()))?;
+            into_result(save_resp)?;
+            Ok(Upd::Notice(format!("已移除并保存来源 {source_id}")))
         }
         Cmd::ScanSource { source_id } => {
             let resp = client

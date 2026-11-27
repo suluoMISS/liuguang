@@ -1,8 +1,10 @@
 # 项目进度与演进路线
 
-当前版本：**0.3.0**（协议：`MIT`，主仓库：<https://github.com/suluoMISS/liuguang>）。
+当前版本：**0.3.1**（协议：`MIT`，主仓库：<https://github.com/suluoMISS/liuguang>）。
 
-## 1. 当前状态（0.3.0）
+## 1. 当前状态（0.3.1）
+
+- **零门槛桌面首启与 GUI 服务控制**：桌面首次启动自动初始化默认配置与壁纸库目录，GUI 内置 `systemd --user` 启停/自启/初始化面板与一键处理横幅，并支持热加载手工补写的 `[library]` 配置；
 
 - **核心引擎与双形态运行**：一套 Rust 代码支持 Wayland 桌面壁纸层（`user` 人格）与无头 DRM/KMS 展示屏（`system` 人格），两者安装策略与权限严格隔离；
 - **零拷贝解码与色彩修正**：完成 `liuguang-vaapi`（FFmpeg VA-API + libva 导出）及合成器兼容用 GPU NV12→RGB 着色器，支持无闪烁实时调节亮度与画面适配；

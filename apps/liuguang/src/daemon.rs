@@ -4790,7 +4790,8 @@ impl Runtime {
     ///
     /// 来源 = `[library].image_dirs`/`video_dirs` + 旧 `[slideshow].directory`（并入去重）
     /// + 运行时 `add_source` − 运行时 `remove_source`。
-    fn handle_list_sources(&self, id: String) -> Response {
+    fn handle_list_sources(&mut self, id: String) -> Response {
+        self.sync_disk_library_if_missing();
         let Some(cfg) = self.library() else {
             return err_response_code(
                 id,
@@ -4849,6 +4850,7 @@ impl Runtime {
     ///   `scanning=true`（不阻塞运行时线程）；客户端应在收到 `SCAN_FINISHED` 后重拉；
     /// - `truncated`/`scanning`/`scan_id`/`generated_unix_ms` 如实反映索引状态。
     fn handle_list_media(&mut self, id: String, params: serde_json::Value) -> Response {
+        self.sync_disk_library_if_missing();
         let params: liuguang_ipc::protocol::ListMediaParams = match serde_json::from_value(params) {
             Ok(p) => p,
             Err(e) => return err_response(id, ErrorKind::InvalidParams, &e.to_string()),
@@ -4925,6 +4927,7 @@ impl Runtime {
 
     /// `scan_source`：启动一次后台扫描（**异步**；结果经 `SCAN_*` 事件返回）。
     fn handle_scan_source(&mut self, id: String, params: serde_json::Value) -> Response {
+        self.sync_disk_library_if_missing();
         let params: ScanSourceParams = match serde_json::from_value(params) {
             Ok(p) => p,
             Err(e) => return err_response(id, ErrorKind::InvalidParams, &e.to_string()),
@@ -4969,6 +4972,7 @@ impl Runtime {
     /// 这里给客户端一个明确的"现在重新读一遍磁盘"入口；由于 `start_scan` 会重建索引，
     /// 磁盘上已删除的条目也会因此消失。
     fn handle_rescan_library(&mut self, id: String) -> Response {
+        self.sync_disk_library_if_missing();
         if self.library().is_none() {
             return err_response_code(
                 id,
@@ -5134,6 +5138,49 @@ impl Runtime {
                 &format!("kind 必须是 image 或 video（收到 {}）", params.kind),
             );
         }
+        let dir = Path::new(&params.path);
+        if !dir.is_absolute() {
+            return err_response_code(
+                id,
+                ErrorKind::InvalidParams,
+                "INVALID_PARAMS",
+                &format!("必须是服务器绝对路径（收到 {}）", params.path),
+            );
+        }
+        if dir
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return err_response_code(
+                id,
+                ErrorKind::InvalidParams,
+                "PATH_OUTSIDE_ROOT",
+                &format!("路径不允许包含 ..（收到 {}）", params.path),
+            );
+        }
+        let is_user = self.persona == liuguang_core::persona::Persona::User;
+        let pre_resolved = if is_user {
+            let Ok(canon) = std::fs::canonicalize(dir) else {
+                return err_response_code(
+                    id,
+                    ErrorKind::FileUnavailable,
+                    "NOT_FOUND",
+                    &format!("目录不存在或无法访问: {}", dir.display()),
+                );
+            };
+            if !canon.is_dir() {
+                return err_response_code(
+                    id,
+                    ErrorKind::FileUnavailable,
+                    "NOT_FOUND",
+                    &format!("目录不存在或不是目录: {}", canon.display()),
+                );
+            }
+            self.ensure_user_library_covers(&canon);
+            Some(canon)
+        } else {
+            None
+        };
         let media = {
             let Some(cfg) = self.library() else {
                 return err_response_code(
@@ -5155,24 +5202,30 @@ impl Runtime {
                 }
             }
         };
-        let dir = Path::new(&params.path);
-        if !dir.is_absolute() {
-            return err_response_code(
-                id,
-                ErrorKind::InvalidParams,
-                "INVALID_PARAMS",
-                &format!("必须是服务器绝对路径（收到 {}）", params.path),
-            );
-        }
-        let resolved = match media.check_dir_in_root(dir) {
-            Ok(p) => p,
-            Err(e) => {
-                return err_response_code(
-                    id,
-                    ErrorKind::InvalidParams,
-                    e.code.as_str(),
-                    &e.message,
-                );
+        let resolved = if let Some(canon) = pre_resolved {
+            match media.check_dir_in_root(dir) {
+                Ok(p) => p,
+                Err(e) => {
+                    return err_response_code(
+                        id,
+                        ErrorKind::InvalidParams,
+                        e.code.as_str(),
+                        &e.message,
+                    );
+                }
+            };
+            canon
+        } else {
+            match media.check_dir_in_root(dir) {
+                Ok(p) => p,
+                Err(e) => {
+                    return err_response_code(
+                        id,
+                        ErrorKind::InvalidParams,
+                        e.code.as_str(),
+                        &e.message,
+                    );
+                }
             }
         };
         if !resolved.is_dir() {
@@ -6163,6 +6216,9 @@ impl Runtime {
     }
 
     fn handle_save_config(&mut self, id: String) -> Response {
+        // 若进程启动时尚未配置 `[library]`，但磁盘上已由用户或初始化脚本补全了该段，
+        // 保存偏好/其它设置时先保留磁盘 `[library]`，避免误将用户刚建的媒体库抹空。
+        self.sync_disk_library_if_missing();
         // **T25-F1**：save 前必须把运行期的来源改动**合并进将要写出的配置**，
         // 否则 `add_source` 只活在内存里：UI 显示"已保存"，重启后用户的新增来源
         // 就消失了。合并发生在 `self.config`（克隆前就地改），因此"写什么"
@@ -7075,6 +7131,97 @@ impl Runtime {
         self.persona = persona;
     }
 
+    /// 若运行期尚未配置 `[library]`，但磁盘 `config.toml` 已由用户或初始化脚本写好该段，
+    /// 直接热采纳磁盘上的 `[library]`，避免"改完配置还要先手工重启服务"。
+    fn sync_disk_library_if_missing(&mut self) {
+        if self.config.library.is_none()
+            && self.config_path.exists()
+            && let Ok(disk_cfg) = Config::load(&self.config_path)
+            && disk_cfg.library.is_some()
+        {
+            tracing::info!(
+                path = %self.config_path.display(),
+                "检测到磁盘配置已补充 [library]，热加载媒体库"
+            );
+            self.config.library = disk_cfg.library;
+            self.media.generated_unix_ms = 0;
+        }
+    }
+
+    /// 桌面模式（`Persona::User`）添加来源目录时自动建立或放宽 `[library].root`。
+    ///
+    /// 系统模式保持严格白名单隔离，不自动放宽 root；桌面模式下用户通过图形界面选择自己的
+    /// 目录时，若尚无 `[library]` 则以规范化 `$HOME`（目录在其下时）或该目录自身为 root，
+    /// 若已有 `root` 且新目录在其外则放宽到两者的公共祖先（绝不退化到 `/`）。
+    fn ensure_user_library_covers(&mut self, resolved: &Path) {
+        let canon_home = std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .and_then(|h| std::fs::canonicalize(Path::new(&h)).ok());
+        let preferred_root = canon_home
+            .as_ref()
+            .filter(|home| resolved.starts_with(home))
+            .cloned()
+            .unwrap_or_else(|| resolved.to_path_buf());
+
+        let Some(lib) = self.config.library.as_mut() else {
+            self.config.library = Some(liuguang_core::library::LibraryConfig {
+                root: preferred_root,
+                image_dirs: Vec::new(),
+                video_dirs: Vec::new(),
+                recursive: true,
+                ..Default::default()
+            });
+            return;
+        };
+
+        let old_root = std::fs::canonicalize(&lib.root).unwrap_or_else(|_| lib.root.clone());
+        if !old_root.is_dir()
+            && lib.image_dirs.is_empty()
+            && lib.video_dirs.is_empty()
+            && lib.sources.is_empty()
+        {
+            lib.root = preferred_root;
+            return;
+        }
+        if resolved.starts_with(&old_root) {
+            return;
+        }
+
+        let common = Self::common_path_ancestor(&old_root, resolved);
+        if common == Path::new("/") || common.as_os_str().is_empty() {
+            return;
+        }
+        let new_root = canon_home
+            .filter(|home| {
+                old_root.starts_with(home) && resolved.starts_with(home) && common.starts_with(home)
+            })
+            .unwrap_or(common);
+
+        for dir in lib.image_dirs.iter_mut().chain(lib.video_dirs.iter_mut()) {
+            if !dir.is_absolute() {
+                *dir = old_root.join(&*dir);
+            }
+        }
+        for src in &mut lib.sources {
+            if !src.path.is_absolute() {
+                src.path = old_root.join(&src.path);
+            }
+        }
+        lib.root = new_root;
+    }
+
+    fn common_path_ancestor(a: &Path, b: &Path) -> PathBuf {
+        let mut out = PathBuf::new();
+        for (ca, cb) in a.components().zip(b.components()) {
+            if ca == cb {
+                out.push(ca.as_os_str());
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
     fn handle_reload(&mut self, id: String) -> Response {
         // 待写偏好必须先落盘：否则重载会把刚改的设置覆盖回文件里的旧值
         // （用户视角：改完点重载，设置没了）。传一个已到期的时刻强制落盘。
@@ -7107,6 +7254,12 @@ impl Runtime {
                     if let Err(e) = self.rebuild_channel_playlist(&key) {
                         self.note_rotation_error(&key, &e.message);
                     }
+                }
+                self.added_sources.clear();
+                self.removed_sources.clear();
+                self.media.generated_unix_ms = 0;
+                if self.library().is_some() {
+                    let _ = self.start_scan();
                 }
                 tracing::info!(path = %self.config_path.display(), "配置已重载并原子生效");
                 ok_response(id, &AcceptedResult::accepted())
@@ -13520,6 +13673,96 @@ mod tests {
             after.contains("[[playlists]]") && after.contains("pl-9"),
             "未装载的播放列表必须**原样保留**在配置里（不得被保存抹掉）：\n{after}"
         );
+    }
+
+    #[test]
+    fn user_persona_add_source_bootstraps_and_widens_library() {
+        let env = TestEnv::new("user-add-source");
+        let dir_a = env.dir.join("wallpapers-a");
+        let dir_b = env.dir.join("wallpapers-b");
+        std::fs::create_dir_all(&dir_a).expect("建目录 A");
+        std::fs::create_dir_all(&dir_b).expect("建目录 B");
+
+        let mut rt = env.runtime(&env.toml("", 3600));
+        rt.set_persona(liuguang_core::persona::Persona::User);
+        assert!(rt.library().is_none(), "初始无 [library]");
+
+        let r1 = ok_json(
+            &mut rt,
+            Method::AddSource,
+            serde_json::json!({"kind": "image", "path": dir_a.display().to_string()}),
+        );
+        assert_eq!(r1["created"], true);
+        assert!(
+            rt.library().is_some(),
+            "桌面首次添加目录应自动初始化 [library]"
+        );
+
+        let r2 = ok_json(
+            &mut rt,
+            Method::AddSource,
+            serde_json::json!({"kind": "video", "path": dir_b.display().to_string()}),
+        );
+        assert_eq!(r2["created"], true);
+
+        let saved = ok_json(&mut rt, Method::SaveConfig, serde_json::json!({}));
+        assert_eq!(saved["saved"], true);
+        assert_eq!(saved["verified"], true);
+
+        let mut rt2 = env.runtime_reload(&["DP-1"]);
+        let ids = source_ids(&mut rt2);
+        let canon_a = std::fs::canonicalize(&dir_a)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let canon_b = std::fs::canonicalize(&dir_b)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(ids.contains(&canon_a), "目录 A 应持久化: {ids:?}");
+        assert!(ids.contains(&canon_b), "目录 B 应持久化: {ids:?}");
+    }
+
+    #[test]
+    fn save_config_preserves_disk_library_when_runtime_started_without_one() {
+        let env = TestEnv::new("save-preserves-disk-lib");
+        seed_library(&env);
+        let mut rt = env.runtime(&env.toml("", 3600));
+        assert!(rt.library().is_none());
+
+        // 模拟用户在守护进程运行期间在磁盘手工补写了 [library]。
+        std::fs::write(env.dir.join("config.toml"), library_toml(&env, "")).expect("写磁盘配置");
+
+        let saved = ok_json(&mut rt, Method::SaveConfig, serde_json::json!({}));
+        assert_eq!(saved["saved"], true);
+        let reloaded = Config::load(&env.dir.join("config.toml")).expect("配置应有效");
+        assert!(
+            reloaded.library.is_some(),
+            "磁盘已有的 [library] 不得被内存空值覆盖"
+        );
+    }
+
+    #[test]
+    fn list_sources_and_media_hot_adopt_disk_library_without_restart() {
+        let env = TestEnv::new("hot-adopt-disk-lib");
+        seed_library(&env);
+        let mut rt = env.runtime(&env.toml("", 3600));
+        assert!(rt.library().is_none());
+
+        // 用户未重启服务，直接往磁盘写了 [library] 段。
+        std::fs::write(env.dir.join("config.toml"), library_toml(&env, "")).expect("写磁盘配置");
+
+        let sources = ok_json(&mut rt, Method::ListSources, serde_json::json!({}));
+        assert!(
+            !sources["sources"].as_array().unwrap().is_empty(),
+            "list_sources 应热加载磁盘上的 [library]: {sources:?}"
+        );
+        let media = ok_json(
+            &mut rt,
+            Method::ListMedia,
+            serde_json::json!({"page": 0, "page_size": 10}),
+        );
+        assert!(media.get("scanning").is_some(), "list_media 应正常进入扫描");
     }
 
     // ==================== T68：播放源 = 播放列表 ====================

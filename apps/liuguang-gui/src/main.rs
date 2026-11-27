@@ -27,6 +27,7 @@ mod ipc;
 mod library;
 mod playlists;
 mod self_test;
+mod service;
 mod settings;
 mod shortcuts;
 mod state;
@@ -75,6 +76,14 @@ pub struct PendingApply {
     request: ApplyRequest,
     /// 已经重试过一次；再失败就不再自动重试。
     tried: bool,
+}
+
+/// 底部提示栏右侧快捷动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeAction {
+    None,
+    EnableUserService,
+    OpenSettings,
 }
 
 pub struct App {
@@ -128,6 +137,10 @@ pub struct App {
     /// 常驻错误区（状态条上方）：完整错误文本，可换行/可选中复制，不靠 toast 承载长文本。
     pub notice_bar: gtk::Revealer,
     pub notice_label: gtk::Label,
+    pub notice_action: gtk::Button,
+    pub notice_action_kind: Cell<NoticeAction>,
+    pub sidebar_top: gtk::ListBox,
+    pub sidebar_bottom: gtk::ListBox,
     /// 启动时对 `NeedsConversion` 条目做过的状态查询（每个条目只查一次）。
     pub compat_probed: RefCell<HashSet<String>>,
     /// 是否已经用过启动时的那一次自动缓存查询（同时作为“已提示”标志）。
@@ -590,12 +603,38 @@ impl App {
     /// （原始消息），按文本比永远不相等——用户会看到两条。归一化后同一个
     /// 码只提示一次，完整信息仍都在常驻区里。
     pub fn notify_error(self: &Rc<Self>, code: &str, message: &str) {
-        self.notice_label.set_text(message);
+        let (display_msg, action_kind, action_label) = if message.contains("连不上 liuguang")
+            && self.persona == Persona::User
+        {
+            (
+                "后台壁纸服务尚未运行，点右侧按钮即可一键初始化配置并启动服务。".to_owned(),
+                NoticeAction::EnableUserService,
+                Some("一键启动并启用服务"),
+            )
+        } else if message.contains("未配置 [library]") {
+            (
+                "尚未配置壁纸目录，点右侧前往「设置 → 媒体来源」添加图片或视频文件夹。".to_owned(),
+                NoticeAction::OpenSettings,
+                Some("前往设置"),
+            )
+        } else {
+            (message.to_owned(), NoticeAction::None, None)
+        };
+
+        self.notice_label.set_text(&display_msg);
         self.notice_label.set_tooltip_text(Some(message));
+        self.notice_action_kind.set(action_kind);
+        if let Some(label) = action_label {
+            self.notice_action.set_label(label);
+            self.notice_action.set_sensitive(true);
+            self.notice_action.set_visible(true);
+        } else {
+            self.notice_action.set_visible(false);
+        }
         self.notice_bar.set_reveal_child(true);
         let now = Instant::now();
         if should_notify(&mut self.notify_seen.borrow_mut(), code, now) {
-            let hint = first_line(message);
+            let hint = first_line(&display_msg);
             self.toast_hint(&hint, message);
         }
     }
@@ -985,10 +1024,14 @@ fn build_ui(gtk_app: &adw::Application, args: Args) {
     let notice_close = gtk::Button::from_icon_name("window-close-symbolic");
     notice_close.add_css_class("flat");
     notice_close.set_tooltip_text(Some("关闭错误提示"));
+    let notice_action = ui::action_button("一键处理", true);
+    notice_action.set_valign(gtk::Align::Center);
+    notice_action.set_visible(false);
     let notice_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     notice_row.add_css_class("notice-row");
     notice_row.append(&notice_close);
     notice_row.append(&notice_label);
+    notice_row.append(&notice_action);
     let notice_bar = gtk::Revealer::new();
     notice_bar.set_transition_type(gtk::RevealerTransitionType::SlideDown);
     notice_bar.set_child(Some(&notice_row));
@@ -1062,6 +1105,10 @@ fn build_ui(gtk_app: &adw::Application, args: Args) {
         notify_seen: RefCell::new(HashMap::new()),
         notice_bar: notice_bar.clone(),
         notice_label: notice_label.clone(),
+        notice_action: notice_action.clone(),
+        notice_action_kind: Cell::new(NoticeAction::None),
+        sidebar_top: sidebar_top.clone(),
+        sidebar_bottom: sidebar_bottom.clone(),
         compat_probed: RefCell::new(HashSet::new()),
         probe_notice_shown: Cell::new(false),
         last_status_key: RefCell::new(String::new()),
@@ -1082,6 +1129,68 @@ fn build_ui(gtk_app: &adw::Application, args: Args) {
         notice_close.connect_clicked(move |_| {
             if let Some(app) = weak.upgrade() {
                 app.notice_bar.set_reveal_child(false);
+                app.notice_action_kind.set(NoticeAction::None);
+                app.notice_action.set_visible(false);
+            }
+        });
+    }
+    {
+        let weak = Rc::downgrade(&app);
+        notice_action.connect_clicked(move |btn| {
+            let Some(app) = weak.upgrade() else {
+                return;
+            };
+            match app.notice_action_kind.get() {
+                NoticeAction::None => {}
+                NoticeAction::OpenSettings => {
+                    app.notice_bar.set_reveal_child(false);
+                    app.notice_action_kind.set(NoticeAction::None);
+                    app.notice_action.set_visible(false);
+                    select_page(&app, &[&app.sidebar_top, &app.sidebar_bottom], "settings");
+                }
+                NoticeAction::EnableUserService => {
+                    btn.set_sensitive(false);
+                    btn.set_label("正在启动…");
+                    let config_path = app.config_path.clone();
+                    let (tx, rx) = async_channel::bounded(1);
+                    std::thread::spawn(move || {
+                        let res = service::run_action(
+                            service::ServiceAction::EnableAndStart,
+                            &config_path,
+                        );
+                        let _ = tx.send_blocking(res);
+                    });
+                    let app_weak = Rc::downgrade(&app);
+                    glib::spawn_future_local(async move {
+                        let Ok(result) = rx.recv().await else { return };
+                        let Some(app) = app_weak.upgrade() else {
+                            return;
+                        };
+                        match result {
+                            Ok((msg, _status)) => {
+                                app.notice_bar.set_reveal_child(false);
+                                app.notice_action_kind.set(NoticeAction::None);
+                                app.notice_action.set_visible(false);
+                                app.toast(&msg);
+                                if let Some(view) = app.settings.borrow().as_ref() {
+                                    settings::refresh_service(&app, view);
+                                }
+                                for cmd in [
+                                    Cmd::Status,
+                                    Cmd::Media,
+                                    Cmd::Sources,
+                                    Cmd::Playlists,
+                                    Cmd::Config,
+                                ] {
+                                    app.send(cmd);
+                                }
+                            }
+                            Err(error) => {
+                                app.notify_error("service", &error);
+                            }
+                        }
+                    });
+                }
             }
         });
     }
@@ -1682,6 +1791,16 @@ fn focus_is_editable(window: &adw::ApplicationWindow) -> bool {
 fn handle_update(app: &Rc<App>, update: Upd) {
     match update {
         Upd::Status(status) => {
+            if app.notice_bar.reveals_child()
+                && app.notice_action_kind.get() == NoticeAction::EnableUserService
+            {
+                app.notice_bar.set_reveal_child(false);
+                app.notice_action_kind.set(NoticeAction::None);
+                app.notice_action.set_visible(false);
+                if let Some(view) = app.settings.borrow().as_ref() {
+                    settings::refresh_service(app, view);
+                }
+            }
             let was_paused = status.paused
                 || status
                     .channels
@@ -1751,6 +1870,13 @@ fn handle_update(app: &Rc<App>, update: Upd) {
                 state.total = total;
                 state.scanning = scanning;
                 state.last_error = None;
+                if app.notice_bar.reveals_child()
+                    && app.notice_action_kind.get() == NoticeAction::OpenSettings
+                {
+                    app.notice_bar.set_reveal_child(false);
+                    app.notice_action_kind.set(NoticeAction::None);
+                    app.notice_action.set_visible(false);
+                }
                 let root = state.library_root();
                 if let Some(root) = root {
                     state.library_hint = format!("把图片或视频放进 {root}，然后点右上角的“刷新”。");

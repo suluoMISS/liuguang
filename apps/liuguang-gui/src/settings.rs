@@ -11,14 +11,25 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::glib;
 use liuguang_core::config::Config;
+use liuguang_core::persona::Persona;
 
 use crate::ipc::Cmd;
-use crate::{App, ui};
+use crate::service::{self, ServiceAction, ServiceStatus};
+use crate::{App, NoticeAction, ui};
 
 /// 设置页控件。
 pub struct SettingsView {
     pub root: gtk::Widget,
+    pub service_group: adw::PreferencesGroup,
+    pub service_row: adw::ActionRow,
+    pub service_start: gtk::Button,
+    pub service_restart: gtk::Button,
+    pub service_stop: gtk::Button,
+    pub service_enable: adw::SwitchRow,
+    pub config_init_row: adw::ActionRow,
+    pub config_init_btn: gtk::Button,
     pub sources_list: gtk::ListBox,
     pub source_path: adw::EntryRow,
     pub source_kind: adw::ComboRow,
@@ -59,6 +70,40 @@ const SOURCE_KINDS: [(&str, &str); 2] = [("image", "图片目录"), ("video", "�
 
 /// 构建设置页。
 pub fn build(app: &Rc<App>) -> Rc<SettingsView> {
+    let service_row = adw::ActionRow::new();
+    service_row.set_title("后台服务状态");
+    service_row.set_subtitle("正在检查用户服务状态…");
+    service_row.set_activatable(false);
+    let service_start = ui::action_button("启动", true);
+    let service_restart = ui::action_button("重启", false);
+    let service_stop = ui::action_button("停止", false);
+    let service_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    service_buttons.append(&service_start);
+    service_buttons.append(&service_restart);
+    service_buttons.append(&service_stop);
+    service_row.add_suffix(&service_buttons);
+
+    let service_enable = adw::SwitchRow::new();
+    service_enable.set_title("登录时自动启动壁纸服务");
+    service_enable.set_subtitle("执行 systemctl --user enable --now liuguang.service");
+
+    let config_init_row = adw::ActionRow::new();
+    config_init_row.set_title("桌面配置文件与默认目录");
+    config_init_row.set_subtitle(&format!("路径：{}", app.config_path.display()));
+    config_init_row.set_activatable(false);
+    let config_init_btn = ui::action_button("一键初始化", false);
+    config_init_row.add_suffix(&config_init_btn);
+
+    let service_group = adw::PreferencesGroup::new();
+    service_group.set_title("后台壁纸服务");
+    service_group.set_description(Some(
+        "桌面模式下无需手工执行命令行，可直接在这里初始化配置并启停后台服务。",
+    ));
+    service_group.add(&service_row);
+    service_group.add(&service_enable);
+    service_group.add(&config_init_row);
+    service_group.set_visible(app.persona == Persona::User);
+
     let sources_list = gtk::ListBox::new();
     sources_list.set_selection_mode(gtk::SelectionMode::None);
     sources_list.add_css_class("boxed-list");
@@ -209,6 +254,7 @@ pub fn build(app: &Rc<App>) -> Rc<SettingsView> {
     // `adw::PreferencesPage` 自带滚动容器；外层再包 ScrolledWindow 会破坏焦点滚屏。
     let page = adw::PreferencesPage::new();
     page.set_vexpand(true);
+    page.add(&service_group);
     page.add(&sources_group);
     page.add(&playback_group);
     page.add(&performance_group);
@@ -226,6 +272,14 @@ pub fn build(app: &Rc<App>) -> Rc<SettingsView> {
 
     let view = Rc::new(SettingsView {
         root: content.upcast(),
+        service_group,
+        service_row,
+        service_start,
+        service_restart,
+        service_stop,
+        service_enable,
+        config_init_row,
+        config_init_btn,
         sources_list,
         source_path,
         source_kind,
@@ -293,6 +347,40 @@ pub fn build(app: &Rc<App>) -> Rc<SettingsView> {
         view.vaapi.connect_changed(move |_| mark_vaapi());
     }
 
+    // —— 后台服务控制（桌面用户模式） ——
+    for (button, action) in [
+        (&view.service_start, ServiceAction::Start),
+        (&view.service_restart, ServiceAction::Restart),
+        (&view.service_stop, ServiceAction::Stop),
+        (&view.config_init_btn, ServiceAction::InitConfig),
+    ] {
+        let app = Rc::downgrade(app);
+        let view_down = Rc::downgrade(&view);
+        button.connect_clicked(move |_| {
+            if let (Some(app), Some(view)) = (app.upgrade(), view_down.upgrade()) {
+                run_service_action(&app, &view, action);
+            }
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        let view_down = Rc::downgrade(&view);
+        view.service_enable.connect_active_notify(move |row| {
+            let (Some(app), Some(view)) = (app.upgrade(), view_down.upgrade()) else {
+                return;
+            };
+            if view.syncing.get() {
+                return;
+            }
+            let action = if row.is_active() {
+                ServiceAction::EnableAndStart
+            } else {
+                ServiceAction::Disable
+            };
+            run_service_action(&app, &view, action);
+        });
+    }
+
     // —— 目录选择器 ——
     {
         let app_down = Rc::downgrade(app);
@@ -346,9 +434,9 @@ pub fn build(app: &Rc<App>) -> Rc<SettingsView> {
                 path: path.clone(),
                 recursive: true,
             });
-            app.send(Cmd::SaveConfig);
             app.send(Cmd::Sources);
             app.send(Cmd::Rescan);
+            app.send(Cmd::Config);
             view.source_path.set_text("");
         });
     }
@@ -443,6 +531,7 @@ pub fn mark_dirty(app: &Rc<App>, view: &Rc<SettingsView>) {
 
 /// 用最新状态/配置刷新设置页（`Upd::Config`、`Upd::Sources` 到达时调用）。
 pub fn refresh(app: &Rc<App>, view: &Rc<SettingsView>) {
+    refresh_service(app, view);
     refresh_sources(app, view);
     let config = app.state.borrow().config.clone();
     if let Some(config) = config {
@@ -463,6 +552,125 @@ pub fn refresh(app: &Rc<App>, view: &Rc<SettingsView>) {
             }
         }
         None => "找不到 HOME/XDG_CONFIG_HOME，无法写自启文件".to_owned(),
+    });
+}
+
+fn set_service_controls_busy(view: &SettingsView, busy: bool) {
+    if busy {
+        view.service_start.set_sensitive(false);
+        view.service_restart.set_sensitive(false);
+        view.service_stop.set_sensitive(false);
+        view.service_enable.set_sensitive(false);
+        view.config_init_btn.set_sensitive(false);
+    }
+}
+
+fn apply_service_status(app: &App, view: &SettingsView, status: &ServiceStatus) {
+    let subtitle = if !status.unit_found {
+        "未检测到用户单元（需先安装 liuguang.service 到用户 systemd 目录）"
+    } else if status.active {
+        "运行中（后台守护进程已就绪）"
+    } else {
+        "未运行（点击右侧“启动”或下方开启登录自启）"
+    };
+    view.service_row.set_subtitle(subtitle);
+    view.service_start
+        .set_sensitive(status.unit_found && !status.active);
+    view.service_restart
+        .set_sensitive(status.unit_found && status.active);
+    view.service_stop
+        .set_sensitive(status.unit_found && status.active);
+    view.service_enable.set_sensitive(status.unit_found);
+    view.config_init_btn.set_sensitive(true);
+
+    view.syncing.set(true);
+    view.service_enable.set_active(status.enabled);
+    view.syncing.set(false);
+
+    if status.config_exists {
+        view.config_init_row
+            .set_subtitle(&format!("配置已就绪：{}", app.config_path.display()));
+        view.config_init_btn.set_label("确认目录与环境");
+    } else {
+        view.config_init_row.set_subtitle(&format!(
+            "尚未创建 {}（点右侧一键生成默认配置与壁纸目录）",
+            app.config_path.display()
+        ));
+        view.config_init_btn.set_label("一键初始化");
+    }
+}
+
+/// 异步刷新桌面模式用户服务与配置文件状态。
+pub fn refresh_service(app: &Rc<App>, view: &Rc<SettingsView>) {
+    if app.persona != Persona::User {
+        return;
+    }
+    let config_path = app.config_path.clone();
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let status = service::query_user_service(&config_path);
+        let _ = tx.send_blocking(status);
+    });
+    let app_weak = Rc::downgrade(app);
+    let view_weak = Rc::downgrade(view);
+    glib::spawn_future_local(async move {
+        if let Ok(status) = rx.recv().await
+            && let (Some(app), Some(view)) = (app_weak.upgrade(), view_weak.upgrade())
+        {
+            apply_service_status(&app, &view, &status);
+        }
+    });
+}
+
+fn run_service_action(app: &Rc<App>, view: &Rc<SettingsView>, action: ServiceAction) {
+    if app.persona != Persona::User {
+        return;
+    }
+    set_service_controls_busy(view, true);
+    view.status.set_text("正在执行用户服务操作…");
+    let config_path = app.config_path.clone();
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let res = service::run_action(action, &config_path);
+        let _ = tx.send_blocking(res);
+    });
+    let app_weak = Rc::downgrade(app);
+    let view_weak = Rc::downgrade(view);
+    glib::spawn_future_local(async move {
+        let Ok(result) = rx.recv().await else { return };
+        let (Some(app), Some(view)) = (app_weak.upgrade(), view_weak.upgrade()) else {
+            return;
+        };
+        match result {
+            Ok((msg, status)) => {
+                apply_service_status(&app, &view, &status);
+                view.status.set_text(&msg);
+                app.toast(&msg);
+                if status.active && app.notice_action_kind.get() == NoticeAction::EnableUserService
+                {
+                    app.notice_bar.set_reveal_child(false);
+                    app.notice_action_kind.set(NoticeAction::None);
+                    app.notice_action.set_visible(false);
+                }
+                if status.active && action == ServiceAction::InitConfig {
+                    app.send(Cmd::Reload);
+                }
+                for cmd in [
+                    Cmd::Status,
+                    Cmd::Media,
+                    Cmd::Sources,
+                    Cmd::Playlists,
+                    Cmd::Config,
+                ] {
+                    app.send(cmd);
+                }
+            }
+            Err(error) => {
+                view.status.set_text(&format!("服务操作失败：{error}"));
+                app.notify_error("service", &error);
+                refresh_service(&app, &view);
+            }
+        }
     });
 }
 
@@ -561,9 +769,9 @@ fn refresh_sources(app: &Rc<App>, view: &Rc<SettingsView>) {
                     app.send(Cmd::RemoveSource {
                         source_id: id.clone(),
                     });
-                    app.send(Cmd::SaveConfig);
                     app.send(Cmd::Sources);
                     app.send(Cmd::Media);
+                    app.send(Cmd::Config);
                 }
             });
         }

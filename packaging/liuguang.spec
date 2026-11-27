@@ -6,8 +6,8 @@
 #   若日后需要调试符号，删掉这行并加 BuildRequires: rust-debugger-common。
 
 Name:           liuguang
-Version:        0.3.0
-Release:        14%{?dist}
+Version:        0.3.1
+Release:        1%{?dist}
 Summary:        Dynamic wallpaper engine: Wayland layer (desktop) and DRM/KMS (headless)
 
 License:        MIT
@@ -163,6 +163,14 @@ fi
 %{_bindir}/liuguangctl
 
 %changelog
+* Fri Nov 27 2026 Liuguang Maintainers <maintainers@liuguang.invalid> - 0.3.1-1
+- feat(gui): add in-app systemd --user service controls (start/stop/restart/enable/init)
+  and actionable first-run notice bar
+- fix(daemon): auto-bootstrap user config on first launch with ProtectHome=read-only fallback,
+  auto-initialize/widen [library] on GUI add_source, and hot-adopt newly written [library]
+  without restarting daemon
+- fix(gui): chain save_config only after add_source/remove_source succeeds
+
 * Fri Nov 27 2026 Liuguang Maintainers <maintainers@liuguang.invalid> - 0.3.0-14
 - perf(mem): thumbnail workers 6 → 2 + malloc_trim after the queue drains,
   RGB converter allocated directly at display size (no rebuild after first frame),
@@ -255,13 +263,13 @@ fi
 - VA-API node arbitration waits up to 500ms for the first frame (non-blocking producer)
 - docs: ARCHITECTURE 8.6.1, PROGRESS, VERIFICATION_2026-11-22_GPU_RGB.md; spec release 13
 * Sat Nov 22 2026 Liuguang Maintainers <maintainers@liuguang.invalid> - 0.2.0-10
-- GPU NV12→XRGB8888 conversion for luma-only compositors: correct colours with
+- GPU NV12→XRGB8888 conversion for luma-only compositors (denial): correct colours with
   zero-copy dma-buf output and no CPU readback (19% single core at 4K60 vs 92% CPU path)
 - prefer the render node of the GPU driving the display when media.video_vaapi = auto
   (cross-GPU import capped the compositor at 20fps)
-- spec release 10
+- docs: ARCHITECTURE §8.4.3, PROGRESS, VERIFICATION_2026-11-22_GPU_RGB.md; spec release 10
 * Sat Nov 22 2026 Liuguang Maintainers <maintainers@liuguang.invalid> - 0.2.0-9
-- 为仅采样亮度的 Wayland 合成器（NV12 多平面导入异常）提供自动回避与 GPU RGB 转换支持
+- denial 合成器的 NV12 多平面导入有缺陷（整屏发红）：自动回避零拷贝、落回 CPU 合成路径
 - export_probe 新增 --ppm（把导出的 dma-buf 写回 PPM，用于取证）；修其 NV12/NV21 色度顺序
 
 * Sat Nov 22 2026 Liuguang Maintainers <maintainers@liuguang.invalid> - 0.2.0-8
