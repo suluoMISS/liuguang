@@ -1,0 +1,21 @@
+[package]
+name = "liuguang-render"
+description = "帧变换与切换特效渲染接口（GPU 渲染路径属 M4）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# GLES 渲染路径（M4）：GBM + EGL/GLES2，编译级验证（真机未验证，见 gles 模块文档）。
+gles = ["dep:gbm", "dep:khronos-egl"]
+
+[dependencies]
+liuguang-core.workspace = true
+thiserror.workspace = true
+gbm = { workspace = true, optional = true }
+khronos-egl = { workspace = true, optional = true }
+
+[lints]
+workspace = true

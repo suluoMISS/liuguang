@@ -1,0 +1,31 @@
+[package]
+name = "liuguang-gui"
+description = "流光（Liuguang） 桌面壁纸配置 GUI（GTK4；独立于守护进程，通过 IPC 控制）"
+version = "0.3.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/suluoMISS/liuguang"
+rust-version = "1.85"
+publish = false
+autobins = false
+
+[[bin]]
+name = "liuguang-gui"
+path = "src/main.rs"
+
+# 这棵子树**不在** workspace 里：GTK4 需要系统开发包（gtk4-devel），
+# 而守护进程/CLI/CI 要能在没有 GTK 的服务器上构建。见 scripts/build-gui.sh。
+[workspace]
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.10", features = ["v4_12"] }
+adw = { package = "libadwaita", version = "0.8", features = ["v1_5"] }
+gdk-pixbuf = "0.21"
+async-channel = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+liuguang-core = { path = "../../crates/liuguang-core", features = ["cli"] }
+liuguang-ipc = { path = "../../crates/liuguang-ipc" }
+
+[lints.rust]
+unsafe_code = "deny"

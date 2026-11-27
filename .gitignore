@@ -1,0 +1,21 @@
+# Cargo / Rust build artifacts
+/target/
+/apps/liuguang-gui/target/
+
+# Packaging build outputs
+/.rpm-vendor/
+/.rpmbuild/
+/packaging/arch/src/
+/packaging/arch/pkg/
+/packaging/arch/gui/src/
+/packaging/arch/gui/pkg/
+/dist/
+*.pkg.tar.zst
+*.pkg.tar.xz
+*.rpm
+
+# Python bytecode & editor swap files
+__pycache__/
+*.pyc
+*.swp
+*.log

@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=流光
+Name[en_US]=Liuguang
+Name[zh_CN]=流光
+Name[zh_TW]=流光
+GenericName=动态壁纸
+GenericName[zh_CN]=动态壁纸
+Comment=挑选、适配并轮播动态壁纸（渲染在 liuguang 里）
+Exec=liuguang-gui
+Icon=liuguang
+Terminal=false
+Categories=Graphics;
+StartupNotify=true
+Keywords=wallpaper;壁纸;liuguang;
+StartupWMClass=io.github.suluoMISS.Liuguang

@@ -1,0 +1,16 @@
+# 流光（Liuguang） 本地 seat 引导（候选 A：专用 VT + logind 会话）— 【草案，未实机验证】
+#
+# 思路：在专用 VT 上以自动登录的 getty 会话运行 liuguang，
+# 使 systemd-logind 把 seat 设备（DRM）授予该活动会话；
+# liuguang 经 libseat(logind 后端) 接收 pause/resume 事件。
+# 该路线用于在独立 TTY 上通过 logind 会话获取受控 DRM seat 访问。
+#
+# 部署（验证后）：
+#   systemctl enable getty@tty2.service
+#   mkdir -p /etc/systemd/system/getty@tty2.service.d/
+#   放置本 drop-in 后 daemon-reload
+# 注意：自动登录涉及本地控制台安全边界，需结合现场安全要求评审。
+
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin liuguang --noclear %I $TERM

@@ -1,0 +1,56 @@
+# Liuguang 的 GTK4 图形界面（Arch Linux）
+#
+# 为什么是**单独的包**：GUI 要 GTK4（几十兆依赖），而守护进程/CLI 必须能在没有
+# GTK 的服务器上安装与运行；GUI 本身也不在 cargo workspace 里
+# （见 docs/ARCHITECTURE.md §9.1）。
+#
+# 用法（在 `packaging/arch/gui/` 目录里）：
+#
+#   BUILDDIR="$PWD/../../../.work/archpkg-gui" PKGDEST="$PWD/../../../dist/arch" \
+#     makepkg --nodeps --noconfirm -f
+#
+# 装好后应用菜单里搜「壁纸」，或直接 `liuguang-gui`。它只通过 IPC 指挥 liuguang，
+# 自己不做渲染 —— 所以守护进程重启后它会自动重连。
+
+pkgname=liuguang-gui
+pkgver=0.3.0
+pkgrel=25
+pkgdesc='Liuguang 的 GTK4 图形界面（挑选媒体、适配/缩放/偏移、目标输出、转场）'
+arch=('x86_64' 'aarch64')
+url='https://github.com/suluoMISS/liuguang'
+license=('MIT')
+depends=('liuguang' 'gtk4' 'libadwaita' 'gdk-pixbuf2')
+makedepends=('cargo' 'rust' 'pkgconf' 'gtk4' 'libadwaita' 'gdk-pixbuf2')
+options=('!lto')
+
+# 源码是同一个工作树（本目录的上三级）。
+_srcroot="$startdir/../../.."
+
+source=()
+sha256sums=()
+
+build() {
+  cd "$_srcroot/apps/liuguang-gui"
+  if [[ -d "$_srcroot/.cargo-home/registry" ]]; then
+    export CARGO_HOME="$_srcroot/.cargo-home"
+  fi
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo build --release --locked
+}
+
+package() {
+  cd "$_srcroot"
+
+  install -Dm0755 "$srcdir/target/release/liuguang-gui" "$pkgdir/usr/bin/liuguang-gui"
+  # 桌面项的单一来源（scripts/build-gui.sh --install 也用它，避免两处漂移）。
+  install -Dm0644 packaging/liuguang-gui.desktop \
+    "$pkgdir/usr/share/applications/liuguang-gui.desktop"
+  # 图标：SVG 是单一来源，PNG 由它渲染（hicolor 各尺寸）。
+  install -Dm0644 packaging/icons/liuguang.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/liuguang.svg"
+  for size in 16 24 32 48 64 128 256 512; do
+    install -Dm0644 "packaging/icons/liuguang-$size.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/liuguang.png"
+  done
+  install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/liuguang-gui/LICENSE"
+}

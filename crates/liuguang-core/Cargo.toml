@@ -1,0 +1,22 @@
+[package]
+name = "liuguang-core"
+description = "Liuguang 共享数据类型、状态机、配置与纯逻辑（禁止依赖 DRM/GStreamer）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+clap = { workspace = true, optional = true }
+
+[features]
+# `PersonaArg`：把 `--persona` 的取值变成 clap 枚举，让非法取值在解析阶段
+# 就以「用法错误（退出码 2）」失败，而不是运行到一半才报错。
+cli = ["dep:clap"]
+
+[lints]
+workspace = true

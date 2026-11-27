@@ -1,0 +1,36 @@
+# Liuguang 可选 drop-in —— 强制 legacy i965 VA 驱动（**非默认，默认不要用**）
+#
+# ## 什么时候才需要它
+#
+# 只有在**同时**满足以下条件时才使用本文件：
+#   1. 部署机拿不到 RPM Fusion nonfree 的 `intel-media-driver`
+#      （网络/策略不允许启用 nonfree 仓库），并且
+#   2. 该机自带的 `libva-intel-media-driver`（iHD）**不暴露 H.264 profile**
+#      （用 `vainfo | grep VAProfileH264` 核实：无输出即不暴露），并且
+#   3. `libva-intel-driver`（i965）已安装且 `LIBVA_DRIVER_NAME=i965 vainfo` 能看到
+#      `VAProfileH264High: VAEntrypointVLD`。
+#
+# 三个条件缺一不可。**默认部署不要安装本 drop-in**：
+# 目标机（Fedora 44 + Intel UHD 630）在装了 nonfree 驱动后，libva 的驱动搜索顺序
+# 是 `dri-nonfree` → `dri-freeworld` → `dri`，nonfree 的 iHD 自动优先，本身自带 H.264，
+# 再加 `LIBVA_DRIVER_NAME=i965` 只会把手动选路变成必须维护的环境变量。
+#
+# ## 代价与风险（写在这里，避免后人当"经验"照抄）
+#
+# - i965 是 Intel 的**遗留**驱动，Gen9 之后的上游支持有限；
+# - 一旦某天 iHD 修好 H.264，本 drop-in 会**静默覆盖**更优路径；
+# - 该环境变量只影响 VA-API 驱动选择，**不能**让缺 H.264 profile 的驱动凭空多出 profile。
+#
+# ## 安装 / 卸载
+#
+#   sudo install -D -m 0644 packaging/va-i965-fallback.conf.example \
+#       /etc/systemd/system/liuguang.service.d/va-i965-fallback.conf
+#   sudo systemctl daemon-reload && sudo systemctl restart liuguang
+#   # 核实实际生效的驱动（日志里应有 VA 能力探测结果）：
+#   liuguangctl status
+#   # 卸载：
+#   sudo rm /etc/systemd/system/liuguang.service.d/va-i965-fallback.conf
+#   sudo systemctl daemon-reload && sudo systemctl restart liuguang
+
+[Service]
+Environment=LIBVA_DRIVER_NAME=i965

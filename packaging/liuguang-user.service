@@ -1,0 +1,94 @@
+# Liuguang **用户级** systemd 单元（桌面 Wayland 壁纸人格）
+#
+# ## 这是什么
+#
+# 0.2 起 liuguang 有两个人格（见 crates/liuguang-core/src/persona.rs）：
+#   * system（默认，旧的 DRM/KMS 路线）→ /etc/liuguang/config.toml、
+#     /run/liuguang/control.sock、/var/lib/liuguang/state.json；由
+#     packaging/liuguang.service（系统单元）拉起。
+#   * user（桌面路线）→ $XDG_CONFIG_HOME/liuguang/config.toml、
+#     $XDG_RUNTIME_DIR/liuguang/control.sock、$XDG_STATE_HOME/liuguang/state.json；
+#     **由本单元**在你自己的会话里拉起（wlr-layer-shell Background 层）。
+#
+# 人格判定：显式 `--backend wayland`，否则有 WAYLAND_DISPLAY 即为 user
+# （apps/liuguang/src/main.rs 的 Persona::detect）。
+#
+# ## 安装
+#
+#     mkdir -p ~/.config/systemd/user
+#     cp packaging/liuguang-user.service ~/.config/systemd/user/
+#     cp /etc/liuguang/config.toml ~/.config/liuguang/config.toml   # 可选
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now liuguang.service
+#
+# 前提：装的是带 wayland 后端的构建（`cargo build --features wayland` 或打包好的
+# RPM），且合成器支持 wlr-layer-shell（niri / sway / Hyprland / river；GNOME 与
+# KDE **不支持**该协议，会在启动时如实报错并停在 HeadlessReady）。
+#
+# 与系统单元的关系：**两者不要同时启用**——同一块屏幕上会互相覆盖，
+# 且系统单元会争夺 DRM master（桌面会话下必然失败并刷日志）。
+#     sudo systemctl disable --now liuguang.service
+#
+# ## 单位置释疑
+#
+# `RuntimeDirectory=` / `StateDirectory=` / `ConfigurationDirectory=` 在**用户**
+# 单元里分别映射到 $XDG_RUNTIME_DIR / $XDG_STATE_HOME / $XDG_CONFIG_HOME 下的
+# 同名子目录，正好与 user 人格的三条路径一致——因此这里不需要显式传
+# --socket/--state-file，让 daemon 自己按人格推导，避免两处写死不同步。
+
+[Unit]
+Description=流光（Liuguang）桌面壁纸层（用户会话）
+Documentation=file:///usr/share/doc/liuguang/README.md
+# 合成器退出后本单元也随之停（wayland socket 没了就没有意义）
+PartOf=graphical-session.target
+After=graphical-session.target
+# 崩溃后限速重启：60s 内最多 5 次，避免合成器不可用时高速重启刷日志
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+Environment=MALLOC_ARENA_MAX=2
+# 显式指定 wayland 后端：即便 WAYLAND_DISPLAY 尚未导出也不会误落到 DRM 分支
+ExecStart=/usr/bin/liuguang --backend wayland
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+RuntimeDirectory=liuguang
+RuntimeDirectoryMode=0700
+StateDirectory=liuguang
+StateDirectoryMode=0700
+CacheDirectory=liuguang
+CacheDirectoryMode=0700
+ConfigurationDirectory=liuguang
+UMask=0077
+
+# 资源退让：装饰层是低优先级工作（权重不是硬上限）
+CPUWeight=20
+IOWeight=20
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# 加固。注意**不能**开 ProtectHome=yes：本单元的 socket/state/config 全在 $HOME。
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# 桌面会话里要读用户自己目录下的图片/视频（媒体库），故 ProtectedHome 必须放开；
+# 若只想暴露壁纸目录，改用 BindPaths= 精确挂载。
+ProtectHome=read-only
+# ProtectHome=read-only 把 $HOME 变成只读，而 CacheDirectory=liuguang 会由 systemd
+# 在首次启动前自动创建 $XDG_CACHE_HOME/liuguang 并赋权可写（避免目录尚不存在时
+# ReadWritePaths 触发 226/NAMESPACE 启动失败），同时媒体目录仍保持只读。
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=graphical-session.target

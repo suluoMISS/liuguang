@@ -1,0 +1,38 @@
+# Liuguang 可选 drop-in —— 启动前拒绝"DRM 已被别人占用"的情况
+#
+# ## 解决什么问题
+#
+# DRM master 是**独占**的：如果启动服务时已经有别的进程持有它（手工调试实例、
+# 残留进程、另一份 unit），liuguang 会**成功启动、IPC 正常、`status` 也正常**，
+# 但每一次提交都是 `Permission denied (EACCES)` ⇒ **屏幕完全不更新**（静默黑屏）。
+# 这个 drop-in 把"安静地黑屏"变成"启动即失败 + journal 里一行明确原因"。
+#
+# ## 为什么默认不装（务必读）
+#
+# 判据需要看**别的进程**是否持有 `/dev/dri/card*`，而普通用户看不到别人的 /proc/<pid>/fd。
+# 因此 `ExecStartPre=` 前面加了 `+`（systemd 的"以完整权限运行该命令"前缀）——
+# 这是一个**只读检查**带来的、窄范围的权限提升，但它确实是权限提升。
+# 默认单元保持最小权限（不加 `+`），由运维显式选择是否采用本 drop-in。
+# 若你的策略不接受任何 `+`，就用等价的手工前置检查（同样有效）：
+#     sudo scripts/drm-master-check.sh preflight     # 有竞争则 exit 3 并打印持有者 PID
+#
+# ## 安装 / 卸载
+#
+#   # 1) 安装检查脚本（与本仓库 scripts/drm-master-check.sh 同源）
+#   sudo install -m 0755 scripts/drm-master-check.sh /usr/local/libexec/liuguang-drm-check
+#   # 2) 启用 drop-in
+#   sudo install -D -m 0644 packaging/drm-exclusive.conf.example \
+#        /etc/systemd/system/liuguang.service.d/drm-exclusive.conf
+#   sudo systemctl daemon-reload
+#   # 3) 观察：有竞争时 `systemctl start liuguang` 会直接失败，journal 里能看到持有者 PID
+#   # 卸载：
+#   sudo rm /etc/systemd/system/liuguang.service.d/drm-exclusive.conf
+#   sudo systemctl daemon-reload
+#
+# 注意：`ExecStartPre=` 的失败会阻止服务启动（这正是本 drop-in 的目的），
+# 因此**残留进程会让服务起不来**——请把"清理残留"当作正常运维动作，
+# 而不是把本 drop-in 去掉。
+
+[Service]
+# 只读预检：若有别的进程持有 DRM 设备，直接失败并打印持有者
+ExecStartPre=+/usr/local/libexec/liuguang-drm-check preflight

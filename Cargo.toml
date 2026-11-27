@@ -1,0 +1,67 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/liuguang-core",
+    "crates/liuguang-display",
+    "crates/liuguang-render",
+    "crates/liuguang-media",
+    "crates/liuguang-ipc",
+    "crates/liuguang-tui",
+    "crates/liuguang-wayland",
+    "crates/liuguang-vaapi",
+    "apps/liuguang",
+    "apps/liuguangctl",
+]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/suluoMISS/liuguang"
+
+[workspace.dependencies]
+liuguang-core = { path = "crates/liuguang-core" }
+liuguang-display = { path = "crates/liuguang-display" }
+liuguang-render = { path = "crates/liuguang-render" }
+liuguang-media = { path = "crates/liuguang-media" }
+liuguang-ipc = { path = "crates/liuguang-ipc" }
+liuguang-tui = { path = "crates/liuguang-tui" }
+liuguang-wayland = { path = "crates/liuguang-wayland" }
+liuguang-vaapi = { path = "crates/liuguang-vaapi" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+toml_edit = "0.22"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
+crossterm = "0.28"
+
+# M1：DRM/KMS 与 PNG（Linux 专属依赖，使用处以 cfg 门控）
+drm = "0.15"
+drm-ffi = "0.9"
+png = "0.18"
+signal-hook = "0.3"
+
+# M2：IPC peer credential 校验（SO_PEERCRED 安全封装）
+nix = { version = "0.29", features = ["net", "user", "fs"] }
+
+# M4：GBM + EGL/GLES 渲染路径（feature = "gles"，编译级验证）
+gbm = "0.18"
+khronos-egl = { version = "6", features = ["dynamic"] }
+
+# M5：GStreamer 视频管线（feature = "gstreamer"，编译级验证）
+gstreamer = "0.24"
+gstreamer-video = "0.24"
+gstreamer-allocators = "0.24"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

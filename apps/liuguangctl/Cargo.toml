@@ -1,0 +1,27 @@
+[package]
+name = "liuguangctl"
+description = "Liuguang 控制端 CLI / TUI（通过 Unix socket 与 liuguang 通信）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+autobins = false
+
+[[bin]]
+name = "liuguangctl"
+path = "src/main.rs"
+
+[dependencies]
+liuguang-core = { workspace = true, features = ["cli"] }
+liuguang-ipc.workspace = true
+liuguang-tui.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

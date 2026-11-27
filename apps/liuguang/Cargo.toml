@@ -1,0 +1,49 @@
+[package]
+name = "liuguang"
+description = "Liuguang 动态壁纸守护进程（Wayland 壁纸层 / DRM-KMS 直出）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# 验收命令 `cargo test -p liuguang --features vaapi --lib` 需要一个 lib 目标；
+# 逻辑放库里，`src/main.rs` 只转调 `main_entry()`。
+name = "liuguang"
+path = "src/lib.rs"
+
+[[bin]]
+name = "liuguang"
+path = "src/main.rs"
+
+[dependencies]
+liuguang-core = { workspace = true, features = ["cli"] }
+liuguang-display.workspace = true
+liuguang-ipc.workspace = true
+liuguang-media.workspace = true
+liuguang-render.workspace = true
+liuguang-wayland.workspace = true
+liuguang-vaapi = { workspace = true, optional = true }
+gstreamer = { workspace = true, optional = true }
+gstreamer-video = { workspace = true, optional = true }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+signal-hook.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+toml_edit.workspace = true
+png.workspace = true
+
+[features]
+# `gstreamer` 同时打开解码依赖：daemon 自己也要 seek 取帧（`get_thumbnail.at_ms`），
+# 光开 `liuguang-media/gstreamer` 不够。
+gstreamer = ["liuguang-media/gstreamer", "dep:gstreamer", "dep:gstreamer-video"]
+vaapi = ["dep:liuguang-vaapi", "gstreamer"]
+
+[dev-dependencies]
+
+[lints]
+workspace = true

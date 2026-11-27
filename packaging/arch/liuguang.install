@@ -1,0 +1,58 @@
+# Liuguang 的 pacman 安装钩子
+#
+# 这里**不创建任何东西**：系统用户来自 `sysusers.d`、媒体根来自 `tmpfiles.d`，
+# 都由 systemd 在安装后与开机时自动落地（声明式、幂等、可自愈）。
+# 安装脚本只做两件元数据工作：让新单元被 systemd 看见，并告诉用户怎么用。
+
+post_install() {
+  # Arch 的 systemd 包自带 daemon-reload 钩子，但显式再跑一次无害且不依赖它。
+  systemctl daemon-reload >/dev/null 2>&1 || :
+  # 先落地系统用户/组（liuguang / liuguang-ctl），再跑 tmpfiles 建 /srv/wallpapers 归属。
+  systemd-sysusers /usr/lib/sysusers.d/liuguang.conf >/dev/null 2>&1 || :
+  # tmpfiles 通常在开机跑；装完立刻建好目录，省得首次启动报"媒体根不存在"。
+  systemd-tmpfiles --create /usr/lib/tmpfiles.d/liuguang.conf >/dev/null 2>&1 || :
+
+  cat <<'EOF'
+
+Liuguang 已安装。两种用法，**不要同时启用**：
+
+  桌面（niri / sway / Hyprland 等 wlroots 系，推荐）
+    bash /usr/share/doc/liuguang/install-user-session.sh
+    → 生成 ~/.config/liuguang/config.toml（媒体目录 ~/Pictures/Wallpapers）
+      并启用 `systemctl --user` 单元；之后用 `liuguangctl status` 或 `liuguang-gui`。
+
+  无头装饰屏（不装桌面，直接吃 HDMI/DP）
+    sudo systemctl enable --now liuguang
+    sudo usermod -aG liuguang-ctl "$USER"   # 免 sudo 用 liuguangctl（需重新登录）
+
+系统单元默认是 disable 的：桌面机器上启用它会以 root 抢 DRM master，把画面撕掉。
+零拷贝（DMA-BUF 直通）在这个包里是**编入**的；`liuguangctl status` 里的 `decoder`
+显示 `vaapi:nvdec(dmabuf)` / `vaapi:vah264dec(dmabuf)` 即生效，`(rgba)` 表示走了回退。
+EOF
+}
+
+post_upgrade() {
+  systemctl daemon-reload >/dev/null 2>&1 || :
+  systemd-sysusers /usr/lib/sysusers.d/liuguang.conf >/dev/null 2>&1 || :
+  systemd-tmpfiles --create /usr/lib/tmpfiles.d/liuguang.conf >/dev/null 2>&1 || :
+  cat <<'EOF'
+Liuguang 已升级。若壁纸在跑：systemctl --user restart liuguang
+EOF
+}
+
+pre_remove() {
+  # 不停系统单元、也不删 /etc/liuguang 与 /srv/wallpapers：那是用户数据，
+  # 而且卸载时停服务容易把"我还在用"的桌面用户壁纸一起打掉。
+  : 
+}
+
+post_remove() {
+  systemctl daemon-reload >/dev/null 2>&1 || :
+  cat <<'EOF'
+Liuguang 已卸载。用户数据保留：
+  /etc/liuguang/config.toml      系统配置
+  /srv/wallpapers/               媒体根（不需要可自行删除）
+连用户一起清掉：sudo userdel liuguang; sudo groupdel liuguang-ctl
+（用户单元若还在跑：systemctl --user disable --now liuguang）
+EOF
+}

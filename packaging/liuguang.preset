@@ -1,0 +1,9 @@
+# Liuguang 默认启用策略（systemd preset，90 = 低优先级，可被管理员覆盖）
+#
+# 目的：`dnf install liuguang` 后服务即 enabled，开机自启点亮装饰屏；
+# 这是装饰屏类服务的产品预期（规范 §0/§12-M2），不是普通后台 daemon。
+#
+# 管理员若不想自启：
+#   systemctl disable liuguang.service
+# 或在 /etc/systemd/system-preset/ 放置更高优先级（数值更小）的 preset 覆盖。
+enable liuguang.service

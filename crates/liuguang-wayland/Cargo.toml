@@ -1,0 +1,22 @@
+[package]
+name = "liuguang-wayland"
+description = "Wayland (wlr-layer-shell) 显示后端：wl_shm CPU 帧，frame 回调背压"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+liuguang-core.workspace = true
+liuguang-display.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+libc = "0.2"
+
+[lints]
+workspace = true

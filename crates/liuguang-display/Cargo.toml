@@ -1,0 +1,22 @@
+[package]
+name = "liuguang-display"
+description = "显示后端抽象（DRM/KMS 属 M1）与可注入 mock 设备"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+liuguang-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+drm.workspace = true
+drm-ffi.workspace = true
+# 帧内容判据需要 mmap/munmap（`Cargo.lock` 里已有，经 nix 传递，非新增外部 crate）
+libc = "0.2"
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "liuguang-ipc"
+description = "IPC 协议 v1（NDJSON framing、版本与包上限；socket 服务端属 M2）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+nix.workspace = true
+
+[lints]
+workspace = true

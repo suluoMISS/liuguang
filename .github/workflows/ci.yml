@@ -1,0 +1,47 @@
+name: ci
+
+# 门禁 = 默认构型 + **feature 矩阵**。
+#
+# 为什么把 feature 矩阵放进同一个 job 且不可跳过：`gstreamer`（视频）与
+# `gles`（GPU 转场）都是**非默认** feature，不带 `--features` 的
+# `cargo test/clippy --workspace` 不会编译它们。
+#
+# 两个阶段各自打印明确结论（默认 feature 全绿 / 矩阵阶段完成），
+# 不允许把前者当作整体通过。
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # 阶段 A：默认 feature 构型
+      - name: 阶段 A — fmt
+        run: cargo fmt --check
+      - name: 阶段 A — clippy（默认构型）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: 阶段 A — test（默认构型）
+        run: cargo test --workspace
+      - name: 阶段 A — 结论
+        run: echo "✅ 默认 feature 全绿（不含 gstreamer / gles）"
+
+      # 阶段 B：feature 矩阵（不可跳过）
+      - name: 阶段 B — liuguang-media（gstreamer）
+        run: |
+          cargo test -p liuguang-media --features gstreamer
+          cargo clippy -p liuguang-media --features gstreamer --all-targets -- -D warnings
+      - name: 阶段 B — liuguang（gstreamer）
+        run: cargo check -p liuguang --features gstreamer
+      - name: 阶段 B — liuguang-render（gles）
+        run: |
+          cargo test -p liuguang-render --features gles
+          cargo clippy -p liuguang-render --features gles --all-targets -- -D warnings
+      - name: 阶段 B — 结论
+        run: echo "✅ feature 矩阵全绿（gstreamer + gles）"

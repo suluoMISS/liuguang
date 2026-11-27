@@ -1,0 +1,148 @@
+# 流光（Liuguang，工程名 Liuguang）示例配置
+# 用户人格默认路径：$XDG_CONFIG_HOME/liuguang/config.toml（通常 ~/.config/liuguang/config.toml）
+# 校验命令：liuguang check-config <本文件>
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ 部署前必读：[outputs."<输出名>"] 段里的 <输出名> 必须是**本机实际输出名**。 │
+# │ 用 `liuguangctl outputs` 查询（本机唯一连接的显示输出是哪一个就写哪一个）。  │
+# │ 名字写错/缺失不会导致命令失败：`set --fit/--zoom/--offset_*` 仍会生效（写入  │
+# │ 内存配置），但**只对这种显式覆盖生效**——它不会替你猜输出名，daemon 会在    │
+# │ 启动时为未声明的输出打一条 WARN 提示。                                      │
+# │ 因此本示例**同时**给出 DP-1 与 HDMI-A-1 两段常见配置，并提供一个生成器：   │
+# │     scripts/gen-outputs-config.sh            # 打印本机应填的 [outputs] 段  │
+# │ 若你的机器是 DP-2 / HDMI-A-2 等其它名字，请自行添加对应段。                 │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# 历史备注：早先版本曾存在 `set --fit/--zoom` 在缺少 [outputs.<name>] 段时
+# 静默不生效的问题。现已修复：覆盖参数会现场建立该输出的显示参数条目；
+# 非法参数（fit 拼写错误 / zoom 越界）会返回 INVALID_PARAMS 错误。
+#
+# 字段实现状态：带 `[未生效]` 标记的字段当前不会改变运行期行为（仅有解析与校验）。
+# 该清单与 `liuguang_core::config::Config::PENDING_IMPLEMENTATION_OPTIONS` 及
+# `Config::pending_implementation()` 一一对应。
+
+[display]
+backend = "auto"                # auto | wayland | drm：auto = 有 WAYLAND_DISPLAY 用桌面壁纸层，否则 DRM/KMS
+device = "auto"                 # 自动检测，不写死 card0/cardN（仅 backend="drm" 时有意义）
+mode = "preferred"              # preferred 或 宽x高[@刷新率Hz]，如 1920x1080@60（wayland 下只接受合成器当前模式）
+vsync = true                    # 生效：true=阻塞提交等 flip（对齐 vblank）；false 要求非阻塞 [未生效]
+
+[media]
+hardware_decode = "auto"        # auto | required | disabled（生效：映射解码策略）
+preferred_decoder = "vaapi"     # [未生效] 解码器按元素可用性 + VA 能力探测决定
+video_fps_limit = 60            # 与面板刷新率一致；低于源帧率会跳帧且不省 CPU
+mute = true                     # 生效（管线本就不输出音频）；false（要求放音）[未生效]
+software_decode_fallback = true # 生效（与 hardware_decode 共同构成解码策略）
+video_vaapi = "auto"             # 生效（需 --features vaapi）：auto | off | /dev/dri/renderD129（须与合成器同卡）
+video_dmabuf_rgb = "auto"          # 生效（需 --features vaapi）：合成器只采样到 Y 时先把帧转成 RGB；auto | always | never
+transcode = "auto"                 # 生效：auto=用 ffmpeg 把硬件解不动的素材（8K H.264 / 10bit）转成 8bit HEVC 缓存 | off=关闭 | /path/to/ffmpeg（也可用 LIUGUANG_TRANSCODE=off）
+transcode_max_width = 0            # 生效：0=保持原分辨率；非 0 时等比缩到该宽度（例如 3840 把 8K 降到 4K，转码更快、画质仍够用）
+transcode_crf_or_bitrate = "hevc_nvenc -b:v 20M"  # 生效：编码器 + 参数（首个词是编码器，其余原样传给 ffmpeg；失败自动退 libx265，空串回落 hevc_nvenc）
+
+[performance]
+preload_next = true             # 生效（2026-10-20）：轮换后预解码"下一张"，命中即跳过同步解码
+max_cache_mb = 128              # 生效（2026-10-20）：预加载缓存的字节软预算，超出按 LRU 淘汰（非整机内存限制）
+frame_queue_size = 3            # 生效（1..=16；视频帧队列长度）
+pause_when_display_off = true   # 生效（2026-10-20）：读 sysfs 的 dpms/status，熄屏即停拉帧、亮屏恢复（只观测不设置）
+pause_on_fullscreen = true      # 生效（2026-11-21）：有窗口全屏（游戏/播放器）时暂停视频；需合成器支持 zwlr_foreign_toplevel_management（niri/sway 有，GNOME/KDE 无）
+reduce_load_on_cpu_pressure = true  # 生效（2026-10-20）：PSI/loadavg 压力档 → 提交频率上限减半 + 暂停预加载
+                                  # 未测量：真机省下多少 CPU 尚无实测数据（docs/PROGRESS.md）
+pause_when_gpu_memory_above = 85   # 生效（2026-11-23）：显存占用 >85% 暂停视频供给，给游戏/渲染让路
+resume_when_gpu_memory_below = 75  # 回落到 75% 以下自动恢复；0 或 <= 下阈值 = 关闭（NVIDIA + AMD sysfs 兜底）
+pause_on_battery = true            # 生效：笔记本切换为电池供电时自动暂停视频壁纸，接通电源后恢复
+detect_games = true              # 生效：探测游戏进程并在其运行期间暂停供给（对无全屏状态事件的合成器尤为实用）
+                                 # 判据：Windows *.exe（含被 comm 截断后的 cmdline 还原）、Steam reaper AppId、Proton、
+                                 #       steamapps/common/<游戏>、gamescope/umu-run/模拟器/Minecraft 与环境变量兜底
+                                 # 滞回：每 2s 采样，连续 2 次命中（≈4s）暂停，连续 4 次未命中（≈8s）恢复
+game_processes = []              # 原生 Linux 游戏的额外特征（不区分大小写的子串，匹配 comm 或 cmdline）
+                                 # 例：["factorio", "dota2"]；环境变量已经能识别的不用写
+game_ignore_processes = []       # 明确不是游戏的特征，优先于所有判据
+                                 # 例：["QQ", "chromium", "electron"]
+
+[slideshow]
+enabled = true                  # 生效（true）；false（关闭轮换）[未生效]
+directory = "/srv/wallpapers"
+interval_seconds = 600
+order = "shuffle"               # sequential | shuffle
+avoid_repeat = true
+
+# ---------------------------------------------------------------------------
+# 媒体库（TUI / IPC `list_media` 的数据来源；**安全边界在 daemon**）
+# ---------------------------------------------------------------------------
+# ┌───────────────────────────────────────────────────────────────────┐
+# │ 本段**必须存在**，媒体库才启用：缺少 `[library]` 时 `list_media`/ │
+# │ `list_sources` 返回 `INVALID_PARAMS/NOT_CONFIGURED`（TUI 媒体库页 │
+# │ 显示红字），**不会**报 "配置错误" => 容易被误认为"没有这个功能"。 │
+# │ 最小可用配置（复制后按本机路径改）：                              │
+# │     [library]                                                     │
+# │     root = "/srv/wallpapers"                                      │
+# │     image_dirs = ["/srv/wallpapers/images"]                       │
+# └───────────────────────────────────────────────────────────────────┘
+# 说明：
+# - `root` 是所有来源的允许根；`image_dirs`/`video_dirs` 必须落在其内，
+#   否则配置校验失败并报字段路径。
+# - 相对路径按 `root` 解析；目录缺失只 WARN 并跳过该来源（daemon 仍启动）。
+# - 图片与视频**可以放同一个目录**（`image_dirs` 与 `video_dirs` 写同一路径）：
+#   扫描按扩展名判定类型，不按来源种类过滤；去重按规范化路径，所以只会有一条
+#   来源记录，但 mp4/mkv/webm/mov 一样会被索引到媒体库。
+# - 旧 `[slideshow].directory` **仍生效**并并入来源集合（去重）。
+# - 运行时改动（`add_source`/`remove_source`/`set_output_transform`）**不落盘**，
+#   只有 IPC `save_config` 才会原子写回本文件。
+[library]
+root = "/srv/wallpapers"                 # 允许根：所有来源必须落在其内（安全边界）
+image_dirs = ["/srv/wallpapers/images"]  # 图片目录（可多个）；须在 root 内
+video_dirs = ["/srv/wallpapers/videos"]  # 视频目录（可多个）；须在 root 内
+recursive = true                         # 是否递归扫描子目录
+# 为空 = 默认图片+视频扩展名（png/jpg/jpeg/webp/bmp/gif + mp4/mkv/webm/mov）
+allowed_extensions = []
+# 单文件最大字节数（0 = 不限制；超过即拒绝并报 TOO_LARGE）
+max_file_bytes = 2147483648
+# 运行期 `add_source` 保存后，来源会落盘成下面这种条目（与 dirs 并列生效）；
+# 手工配置也可直接写：kind = "image" | "video" | "all"，path 为绝对路径或相对 root。
+# [[library.sources]]
+# path = "/srv/wallpapers/extra"
+# kind = "all"
+# recursive = true
+
+[transition]
+enabled = true
+effect = "fade"                 # fade | slide | wipe | circle | random | none
+duration_ms = 350               # 合法范围 0..=10000
+easing = "ease-in-out"          # linear | ease-in | ease-out | ease-in-out
+# direction = "left"            # left | right | up | down（适用效果使用）
+
+# --- 输出段：名字必须是本机实际输出名（见文件头说明）---
+
+[outputs."DP-1"]
+fit = "cover"                   # cover | contain | stretch | center
+zoom = 1.0                      # (0, 10]
+offset_x = 0.0                  # 输出像素
+offset_y = 0.0                  # 输出像素
+# fallback_image = "/srv/wallpapers/fallback.png"  # 缺省不设后备图
+# rotation = "90"               # "0" | "90" | "180" | "270"（顺时针）
+# brightness = 1.0              # 亮度倍率 0.1..=1.0（1.0 = 原始，实时生效，只压暗不过曝）
+# media_directory = "/srv/media2" # 本输出独立播放列表目录（缺省 slideshow.directory）
+# interval_seconds = 300        # 本输出独立轮换间隔
+# order = "sequential"          # 本输出独立顺序：sequential | shuffle
+
+[outputs."HDMI-A-1"]
+fit = "cover"
+zoom = 1.0
+offset_x = 0.0
+offset_y = 0.0
+fallback_image = "/srv/wallpapers/fallback.png"
+
+# 其它输出名（如 DP-2 / HDMI-A-2）照抄上面任一整段，改段名即可。
+
+# --- IPC / 运行时 ---
+[ipc]
+socket_path = "/run/liuguang/control.sock"   # 控制 socket（0660 + peer credential）
+
+[runtime]
+state_file = "/var/lib/liuguang/state.json"  # 运行状态持久化
+
+# media.allowed_roots：IPC set 的媒体目录白名单（绝对路径）。
+# 为空时仅允许 slideshow.directory。示例：
+# allowed_roots = ["/srv/wallpapers", "/srv/media"]
+# 边界说明：这是**防误用的名字空间白名单**，不是完备的安全边界——
+# 白名单目录内的硬链接仍可指向白名单外的 inode。见 docs/DEPLOYMENT.md「安全边界」。

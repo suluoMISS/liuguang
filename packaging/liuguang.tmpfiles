@@ -1,0 +1,10 @@
+# Liuguang 默认媒体根的创建（tmpfiles.d(5)）
+#
+# 为什么用 tmpfiles 而不是安装脚本里 mkdir：声明式、幂等，`systemd-tmpfiles
+# --create` 在开机与安装后都会跑；目录被误删也能自愈。
+#
+# 2770 = 组可写 + setgid：`liuguang-ctl` 组成员不 sudo 也能放素材，新文件继承组。
+# 不要降回 0755/0750 —— 那会让"加组即用"失效，成员只能 sudo 拷文件。
+d /srv/wallpapers         2770 liuguang liuguang-ctl -
+d /srv/wallpapers/images  2770 liuguang liuguang-ctl -
+d /srv/wallpapers/videos  2770 liuguang liuguang-ctl -

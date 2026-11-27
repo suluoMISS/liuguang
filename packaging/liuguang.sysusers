@@ -1,0 +1,27 @@
+# Liuguang 系统用户与组声明（sysusers.d(5)）
+#
+# 安装：
+#   sudo install -m 0644 packaging/liuguang.sysusers /usr/lib/sysusers.d/liuguang.conf
+#   sudo systemd-sysusers
+#
+# 它创建：
+#   * 用户 liuguang（系统用户、无登录 shell、家目录 /var/lib/liuguang）——守护进程身份；
+#   * 组 liuguang-ctl —— **控制组**：systemd 单元的 Group= 即此组，
+#     因此 /run/liuguang 与控制 socket 都归它所有。把需要控制权限的普通用户
+#     加入该组即可使用 `liuguangctl`（无需 sudo）：
+#         sudo usermod -aG liuguang-ctl <user>
+#     ⚠ 组变更在**新会话**才生效（重新登录 / 重新 ssh）。
+#   * liuguang 用户加入 video / render 组 —— 访问 /dev/dri/card* 与 /dev/dri/renderD*。
+#
+# 若目标发行版没有 sysusers，等价的命令是：
+#   sudo useradd --system --home /var/lib/liuguang --shell /usr/sbin/nologin liuguang
+#   sudo groupadd --system liuguang-ctl
+#   sudo usermod -aG video,render liuguang
+
+# Type  Name          ID  GECOS                          Home                Shell
+u       liuguang       -   "Liuguang display daemon"      /var/lib/liuguang   /usr/sbin/nologin
+g       liuguang-ctl  -
+
+# 用户 → 组 成员关系
+m       liuguang       video
+m       liuguang       render

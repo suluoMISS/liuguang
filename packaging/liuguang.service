@@ -1,0 +1,143 @@
+# Liuguang systemd 单元
+#
+# ## 交付状态（2026-10-18 真机实测后更正，务必如实理解）
+#
+# ✅ **已验证：本单元能在非 root、无任何登录会话的情况下拿到 DRM master 并上屏。**
+#    真机证据（`scripts/drm-master-check.sh measure service`）：
+#      内核 clients 表 master=y（tgid=服务主进程）
+#      「首帧/模式变更帧已提交扫描输出」= 1，`提交彻底失败` = 0，`Permission denied` = 0
+#    ⇒ 之前"非 root 服务拿不到 DRM master"的说法**是错的**：那 12591 次 EACCES 是
+#    **多个实例争抢 master** 造成的（master 独占，后启动者每次提交都 EACCES ⇒ 静默黑屏）。
+#
+# ⚠ **真实运维前提：同一时刻只允许一个实例持有 DRM。**
+#    起服务前先确认没有别的实例（手工调试实例、残留进程、另一份单元）：
+#        sudo scripts/drm-master-check.sh preflight      # 有竞争会拒绝测量并给出持有者 PID
+#    竞争时的病征：`journalctl -u liuguang | grep -c "Permission denied"` 持续增长，
+#    屏幕**完全不更新**（但进程活着、IPC 正常、`status` 也正常 —— 这正是它危险的地方）。
+#    想让它"启动前就失败"而不是"安静地黑屏"，可选用 `packaging/drm-exclusive.conf.example`。
+#
+# ⏳ **未验收：`systemctl enable` 后的冷启动未做真机重启实测。**
+#    机制上已不再依赖会话（见上），因此风险从"机制缺口"降级为"尚未实测"，
+#    但在真正重启验证过之前，**不要对外声称"开机自启已验收"**（规范 §15.2）。
+#
+# ⚠ **（t15 实测记录；t16 已修）曾存在缺陷：失去 master 后不会自愈。**
+#    t16 已实现显式 `DRM_IOCTL_SET_MASTER` + `try_reacquire_master()` 自愈，
+#    并在有竞争时**启动阶段即 ERROR** 指名持有者 PID/命令名（不再刷屏）。
+#    下面的分析与配方仍保留：预检可避免进入 ERROR 路径，且'重启竞争'正是自愈要覆盖的场景。
+#    根因（已定位）：`crates/liuguang-display` **从不调用 `DRM_IOCTL_SET_MASTER`**，
+#    只靠"我是第一个打开该设备的客户端"。因此只要打开设备时别人已持有 master，
+#    实例就会永久无 master：进程活着、IPC 正常、`status` 正常，但每次提交都
+#    `Permission denied (EACCES)`，屏幕停在旧帧，**不会自愈**。
+#    已复现的两个触发条件：
+#      (a) 外部实例竞争（手工调试实例/残留进程）—— 稳定复现；
+#      (b) **重启竞争**：旧实例尚未释放设备时新实例已被拉起（`Restart=on-failure`
+#          或 `systemctl restart` 都可能踩到）—— 真机复现过 1 次。
+#    注意：`chvt` 往返本身**不必然**致坏（复测未复现），它是暴露竞争时序的诱因之一。
+#    可靠配方：先 `scripts/drm-master-check.sh preflight`（确认空闲）→ 再
+#    `systemctl restart liuguang` → 再 `verify` 复检。反例：在别人持有 master 时直接重启。
+#
+# ## 与硬解驱动的关系（2026-10-18 更新，重要）
+#
+# **本单元刻意不设置 `LIBVA_DRIVER_NAME`。** 目标机已安装 RPM Fusion nonfree 的
+# `intel-media-driver`（`/usr/lib64/dri-nonfree/iHD_drv_video.so`），libva 的驱动搜索
+# 顺序把 `dri-nonfree` 排在 `dri` 之前 → 默认驱动即自带 H.264 profile，无需环境变量。
+# 详见 docs/DEPLOYMENT.md §2.5。
+# 仅当部署机**确实**拿不到 nonfree 驱动、且确认 i965 是唯一可用路线时，才使用
+# `packaging/va-i965-fallback.conf.example` 这一可选的 drop-in（含适用条件与代价）。
+
+[Unit]
+Description=流光（Liuguang）动态壁纸守护进程（无头 DRM/KMS）
+Documentation=file:///usr/share/doc/liuguang/README.md
+Documentation=file:///usr/share/doc/liuguang/DEPLOYMENT.md
+After=systemd-logind.service
+# 不依赖 graphical.target：在 multi-user.target 环境运行（规范 §11.1）
+Conflicts=getty@tty2.service
+
+# 崩溃后限速重启：60s 内最多 5 次，避免无限高速重启（规范 §11.1）
+# 注意：StartLimitIntervalSec/StartLimitBurst 属于 [Unit] 段；写在 [Service] 会被忽略。
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=liuguang
+# 主组是**控制组**，不是"守护进程私有组"：RuntimeDirectory 与其中的控制 socket
+# 都归该组所有，因此"谁能控制 liuguang"= "谁在这个组里"，是部署时显式选择的。
+# 服务端的授权判定会放行"socket 文件所属组"的成员（见 docs/IPC_PROTOCOL.md §2）。
+# 组由 packaging/liuguang.sysusers 声明：
+#     systemd-sysusers packaging/liuguang.sysusers
+#     usermod -aG liuguang-ctl <需要控制权限的普通用户>   # 之后需重新登录
+Group=liuguang-ctl
+
+# 访问 DRM/VA-API 设备所需的补充组（video 拥有 /dev/dri/card*，render 拥有 /dev/dri/renderD*）。
+# 规范 §2.2 禁止写死 card0/cardN，因此这里**不使用** DeviceAllow= 固定节点，
+# 而是依靠 udev 的组权限让进程发现实际设备（真机为 card1）。
+SupplementaryGroups=video render
+
+ExecStart=/usr/bin/liuguang --config /etc/liuguang/config.toml --socket /run/liuguang/control.sock --state-file /var/lib/liuguang/state.json
+Environment=MALLOC_ARENA_MAX=2
+
+Restart=on-failure
+RestartSec=5
+# 停机超时：保证 socket 与 DRM 资源有机会释放
+TimeoutStopSec=15
+
+# 目录与权限（最小必要，规范 §11.1）
+# RuntimeDirectoryMode 必须是"属主可读写**且可进入**"的模式：
+#   0660 缺少 x（搜索）位 → 连属主都无法在该目录内创建 socket，
+#   服务会在 bind() 处以 EACCES 启动失败。
+#   0750 = 属主 rwx + 同组 r-x + 其他无权限；socket 本身的 0660 由
+#   crates/liuguang-ipc/src/server.rs 单独设置，不要在目录上复用 0660。
+RuntimeDirectory=liuguang
+RuntimeDirectoryMode=0750
+# 运行状态（state.json）与调度无关，保持仅属主可读（比 socket 目录更严）。
+StateDirectory=liuguang
+StateDirectoryMode=0700
+ConfigurationDirectory=liuguang
+UMask=0027
+
+# 资源退让：装饰屏是低优先级服务（权重，不是硬上限；规范 §11.1/§13.2）
+CPUWeight=20
+IOWeight=20
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# 不启用实时调度 / 高优先级 GPU 忙轮询（规范 §11.1）
+CPUSchedulingPolicy=other
+
+# 安全加固
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# 注意：不要启用 ProtectProc=invisible —— 组授权需要读取对端进程的
+# /proc/<pid>/status（Groups 行），invisible 会让该读取失败，
+# 从而把组授权静默退化成"只能看主组"。
+# SELinux 必须保持 Enforcing（禁止以 setenforce 0 作为安装步骤，规范 §11.1）。
+# 如需自定义策略，只授予最小权限并单独记录。
+
+
+# ── DMA-BUF 直通开关（**已停用**：直通路径 2026-10-20 从显示侧移除）─────────
+# 开关：LIUGUANG_VIDEO_DMABUF（1 / off / force-fail）
+#
+# 为什么注释掉而不是保留 =1：
+#   显示侧 `present_fitted` 不再扫描输出 DMA-BUF（扫描期间缓冲被上游重写 ⇒ 重影）。
+#   遗留 `=1` 曾被认为只是"无效开关"，但它会让媒体侧继续按 DMA-BUF 协商开管线，
+#   与后端能力不一致（2026-10-20 审核 P1-1）。现在 daemon 以
+#   `DisplayBackend::supports_dmabuf_scanout()` 为准强制 CPU 捕获，本行也不再需要
+#   手工改；沿用旧 unit 升级同样自动走 CPU 路径。
+#
+# 直通恢复后（生产者租约 + 显示完成通知协同）
+# 才重新启用本行；是否生效看 `liuguangctl status` 的 decoder 括号里的捕获模式。
+#Environment=LIUGUANG_VIDEO_DMABUF=1
+
+[Install]
+WantedBy=multi-user.target

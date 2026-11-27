@@ -1,0 +1,24 @@
+[package]
+name = "liuguang-media"
+description = "媒体源抽象与帧队列接口（PNG 解码属 M1，GStreamer/VA-API 属 M5）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+liuguang-core.workspace = true
+png.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+gstreamer = { workspace = true, optional = true }
+gstreamer-video = { workspace = true, optional = true }
+gstreamer-allocators = { workspace = true, optional = true }
+
+[features]
+# M5：真实 MP4/H.264 解码管线（非默认；编译级验证，真机验证由上层负责）
+gstreamer = ["dep:gstreamer", "dep:gstreamer-video", "dep:gstreamer-allocators"]
+
+[lints]
+workspace = true

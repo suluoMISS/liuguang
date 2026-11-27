@@ -1,0 +1,23 @@
+[package]
+name = "liuguang-vaapi"
+description = "VA-API 硬件解码 + DMA-BUF 导出（NVIDIA NVDEC 零拷贝视频源）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[dependencies]
+liuguang-core.workspace = true
+liuguang-media = { workspace = true, features = ["gstreamer"] }
+tracing.workspace = true
+thiserror.workspace = true
+libc = "0.2"
+# `convert`（NV12 → XRGB8888 的 GPU 转换）需要自己开 gbm 设备与 EGL display；
+# 两者原本只在 `examples/egl_convert.rs` 里用到，产品路径也要用了。
+gbm.workspace = true
+khronos-egl.workspace = true
+
+[lints]
+workspace = true

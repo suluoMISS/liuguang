@@ -1,0 +1,126 @@
+# Liuguang — Arch Linux 打包（makepkg）
+#
+# 与其他发行版的差别（都是有意的）：
+#
+#   1. **构建时启用 `vaapi` feature**。Fedora 主仓没有 ffmpeg-devel/libva-devel，
+#      所以 RPM 不带零拷贝；Arch 的 `extra` 里 ffmpeg 与 libva 都在，没有任何理由
+#      让 Arch 用户自己编译。装完即是"解码器 DMA-BUF 直通合成器"的路径。
+#   2. **系统单元装了但默认不启用**（preset 显式 disable）。桌面机器上启用系统单元
+#      会以 root 抢 DRM master，把画面撕掉；桌面用户该用 `systemctl --user`
+#      （见 `/usr/share/doc/liuguang/install-user-session.sh`）。
+#      无头的装饰屏机器手工 `systemctl enable --now liuguang` 即可。
+#   3. 媒体库默认落在 `~/Pictures/Wallpapers`（由安装脚本写用户配置），
+#      系统配置 `/etc/liuguang/config.toml` 只是模板。
+#
+# 用法（在 `packaging/arch/` 目录里）：
+#
+#   BUILDDIR="$PWD/../../.work/archpkg" PKGDEST="$PWD/../../dist/arch" \
+#     makepkg -f --nodeps          # --nodeps 仅用于本机缺 makedepends 时自测
+#
+# 图形界面是**单独的包**（`packaging/arch/gui/`）：它要 GTK4，而守护进程/CLI 必须能
+# 在没有 GTK 的服务器上安装；也避免不想装图形栈的人被拖进几十兆依赖。
+
+pkgbase=liuguang
+pkgname=liuguang
+pkgver=0.3.0
+pkgrel=16
+pkgdesc='Linux 动态壁纸（桌面 Wayland 壁纸层 / 无头 DRM-KMS）'
+arch=('x86_64' 'aarch64')
+url='https://github.com/suluoMISS/liuguang'
+license=('MIT')
+options=('!lto')
+
+# 源码就是这份 git 工作树：makepkg 在 `packaging/arch/` 里跑，源码树是它的上两级。
+# 这样每次 `makepkg` 打的就是**当前提交**，不会出现"包里的代码和仓库不一致"。
+_srcroot="$startdir/../.."
+
+depends=(
+  'wayland'        # libwayland-client
+  'libdrm'
+  'gstreamer'      # 库
+  'gst-plugins-base'
+  'gst-plugins-good'
+  'gst-libav'      # 回退路径的软件解码（avdec_h264）
+  'ffmpeg'         # vaapi feature 链接 libavcodec/libavformat/libavutil
+  'libva'
+)
+makedepends=(
+  'cargo'
+  'rust'
+  'pkgconf'
+  'libdrm'
+  'libva'
+  'ffmpeg'
+  'gstreamer'
+  'wayland'
+)
+optdepends=(
+  'gst-plugin-va: GStreamer 的 VA-API 硬解（仅在零拷贝不可用时的回退路径上才需要）'
+  'intel-media-driver: Intel 核显的 VA-API 驱动（iHD）'
+  'libva-nvidia-driver: NVIDIA 的 VA-API 驱动（NVDEC）'
+)
+install="$pkgname.install"
+source=()
+sha256sums=()
+
+# ── 构建 ────────────────────────────────────────────────────────────────────
+# CARGO_HOME 优先复用仓库里那份（离线可用、避免每次重下 crate）；
+# 目标目录放进 $srcdir，绝不写进工作树（否则 makepkg 会把它当源码残留）。
+_cargo_home() {
+  if [[ -d "$_srcroot/.cargo-home/registry" ]]; then
+    printf '%s' "$_srcroot/.cargo-home"
+  else
+    printf '%s' "$HOME/.cargo"
+  fi
+}
+
+build() {
+  cd "$_srcroot"
+  export CARGO_HOME="$(_cargo_home)"
+  export CARGO_TARGET_DIR="$srcdir/target"
+  export RUSTFLAGS="${RUSTFLAGS:-}"
+
+  # vaapi 隐含 gstreamer（见 apps/liuguang/Cargo.toml 的 [features]）。
+  cargo build --release --locked \
+    -p liuguang -p liuguangctl --features liuguang/vaapi
+}
+
+package() {
+  cd "$_srcroot"
+
+  install -Dm0755 "$srcdir/target/release/liuguang"   "$pkgdir/usr/bin/liuguang"
+  install -Dm0755 "$srcdir/target/release/liuguangctl" "$pkgdir/usr/bin/liuguangctl"
+
+  # 单元里 ExecStart 写的是 /usr/local/bin（面向手工部署），包内必须是 /usr/bin。
+  sed 's|/usr/local/bin/liuguang|/usr/bin/liuguang|g' packaging/liuguang.service \
+    | install -Dm0644 /dev/stdin "$pkgdir/usr/lib/systemd/system/liuguang.service"
+
+  # 系统用户/组：sysusers.d 是声明式的，systemd 在安装后与开机时自动落地。
+  install -Dm0644 packaging/liuguang.sysusers \
+    "$pkgdir/usr/lib/sysusers.d/liuguang.conf"
+  # 媒体根：tmpfiles.d 同样声明式、幂等、可自愈（比安装脚本里 mkdir 稳）。
+  install -Dm0644 packaging/liuguang.tmpfiles \
+    "$pkgdir/usr/lib/tmpfiles.d/liuguang.conf"
+
+  # 显式 disable：桌面机器用用户单元，系统单元只在无头机器上手工启用。
+  install -d "$pkgdir/usr/lib/systemd/system-preset"
+  printf '# Liuguang：桌面请用 `systemctl --user`（见 docs 里的 install-user-session.sh）。\n# 无头装饰屏机器：`sudo systemctl enable --now liuguang`。\ndisable liuguang.service\n' \
+    > "$pkgdir/usr/lib/systemd/system-preset/90-liuguang.preset"
+
+  install -Dm0644 config/example.toml "$pkgdir/etc/liuguang/config.toml"
+
+  # 用户会话单元装到系统级用户单元目录：`systemctl --user enable --now liuguang`
+  # 开箱即用（不能替某个登录用户 enable，但可以把单元放到位）。
+  install -Dm0644 packaging/liuguang-user.service \
+    "$pkgdir/usr/lib/systemd/user/liuguang.service"
+  install -Dm0755 scripts/install.sh "$pkgdir/usr/share/doc/liuguang/install.sh"
+  install -Dm0755 scripts/install-user-session.sh \
+    "$pkgdir/usr/share/doc/liuguang/install-user-session.sh"
+  install -Dm0755 scripts/build-gui.sh "$pkgdir/usr/share/doc/liuguang/build-gui.sh"
+  install -Dm0644 README.md "$pkgdir/usr/share/doc/liuguang/README.md"
+  for doc in ARCHITECTURE USAGE CONFIGURATION GUI DEPLOYMENT IPC_PROTOCOL \
+             VERIFICATION PROGRESS DEVELOPMENT TUI; do
+    install -Dm0644 "docs/$doc.md" "$pkgdir/usr/share/doc/liuguang/$doc.md"
+  done
+  install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/liuguang/LICENSE"
+}
