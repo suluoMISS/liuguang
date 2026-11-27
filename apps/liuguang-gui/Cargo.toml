@@ -29,3 +29,46 @@ liuguang-ipc = { path = "../../crates/liuguang-ipc" }
 
 [lints.rust]
 unsafe_code = "deny"
+
+[package.metadata.deb]
+maintainer = "suluoMISS <suluoMISS@users.noreply.github.com>"
+copyright = "2026, suluoMISS (Liuguang Contributors)"
+license-file = ["../../LICENSE", "0"]
+section = "x11"
+priority = "optional"
+depends = "liuguang, libgtk-4-1, libadwaita-1-0, libgdk-pixbuf-2.0-0"
+assets = [
+  ["target/release/liuguang-gui", "usr/bin/liuguang-gui", "755"],
+  ["../../packaging/liuguang-gui.desktop", "usr/share/applications/liuguang-gui.desktop", "644"],
+  ["../../packaging/icons/liuguang.svg", "usr/share/icons/hicolor/scalable/apps/liuguang.svg", "644"],
+  ["../../packaging/icons/liuguang-16.png", "usr/share/icons/hicolor/16x16/apps/liuguang.png", "644"],
+  ["../../packaging/icons/liuguang-24.png", "usr/share/icons/hicolor/24x24/apps/liuguang.png", "644"],
+  ["../../packaging/icons/liuguang-32.png", "usr/share/icons/hicolor/32x32/apps/liuguang.png", "644"],
+  ["../../packaging/icons/liuguang-48.png", "usr/share/icons/hicolor/48x48/apps/liuguang.png", "644"],
+  ["../../packaging/icons/liuguang-64.png", "usr/share/icons/hicolor/64x64/apps/liuguang.png", "644"],
+  ["../../packaging/icons/liuguang-128.png", "usr/share/icons/hicolor/128x128/apps/liuguang.png", "644"],
+  ["../../packaging/icons/liuguang-256.png", "usr/share/icons/hicolor/256x256/apps/liuguang.png", "644"],
+  ["../../packaging/icons/liuguang-512.png", "usr/share/icons/hicolor/512x512/apps/liuguang.png", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+  { source = "target/release/liuguang-gui", dest = "/usr/bin/liuguang-gui", mode = "755" },
+  { source = "../../packaging/liuguang-gui.desktop", dest = "/usr/share/applications/liuguang-gui.desktop", mode = "644" },
+  { source = "../../packaging/icons/liuguang.svg", dest = "/usr/share/icons/hicolor/scalable/apps/liuguang.svg", mode = "644" },
+  { source = "../../packaging/icons/liuguang-16.png", dest = "/usr/share/icons/hicolor/16x16/apps/liuguang.png", mode = "644" },
+  { source = "../../packaging/icons/liuguang-24.png", dest = "/usr/share/icons/hicolor/24x24/apps/liuguang.png", mode = "644" },
+  { source = "../../packaging/icons/liuguang-32.png", dest = "/usr/share/icons/hicolor/32x32/apps/liuguang.png", mode = "644" },
+  { source = "../../packaging/icons/liuguang-48.png", dest = "/usr/share/icons/hicolor/48x48/apps/liuguang.png", mode = "644" },
+  { source = "../../packaging/icons/liuguang-64.png", dest = "/usr/share/icons/hicolor/64x64/apps/liuguang.png", mode = "644" },
+  { source = "../../packaging/icons/liuguang-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/liuguang.png", mode = "644" },
+  { source = "../../packaging/icons/liuguang-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/liuguang.png", mode = "644" },
+  { source = "../../packaging/icons/liuguang-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/liuguang.png", mode = "644" },
+  { source = "../../LICENSE", dest = "/usr/share/licenses/liuguang-gui/LICENSE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+liuguang = "*"
+gtk4 = "*"
+libadwaita = "*"
+gdk-pixbuf2 = "*"

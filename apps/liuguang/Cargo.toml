@@ -47,3 +47,56 @@ vaapi = ["dep:liuguang-vaapi", "gstreamer"]
 
 [lints]
 workspace = true
+
+[package.metadata.deb]
+maintainer = "suluoMISS <suluoMISS@users.noreply.github.com>"
+copyright = "2026, suluoMISS (Liuguang Contributors)"
+license-file = ["../../LICENSE", "0"]
+section = "x11"
+priority = "optional"
+depends = "libwayland-client0, libdrm2, libgbm1, libgstreamer1.0-0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-libav"
+recommends = "gstreamer1.0-vaapi, ffmpeg"
+conf-files = ["/etc/liuguang/config.toml"]
+assets = [
+  ["target/release/liuguang", "usr/bin/liuguang", "755"],
+  ["../../packaging/liuguang.service", "usr/lib/systemd/system/liuguang.service", "644"],
+  ["../../packaging/liuguang-user.service", "usr/lib/systemd/user/liuguang.service", "644"],
+  ["../../packaging/liuguang.preset", "usr/lib/systemd/system-preset/90-liuguang.preset", "644"],
+  ["../../packaging/liuguang.sysusers", "usr/lib/sysusers.d/liuguang.conf", "644"],
+  ["../../packaging/liuguang.tmpfiles", "usr/lib/tmpfiles.d/liuguang.conf", "644"],
+  ["../../config/example.toml", "etc/liuguang/config.toml", "644"],
+  ["../../scripts/install.sh", "usr/share/doc/liuguang/install.sh", "755"],
+  ["../../scripts/install-user-session.sh", "usr/share/doc/liuguang/install-user-session.sh", "755"],
+  ["../../README.md", "usr/share/doc/liuguang/README.md", "644"],
+  ["../../docs/DEPLOYMENT.md", "usr/share/doc/liuguang/DEPLOYMENT.md", "644"],
+  ["../../docs/CONFIGURATION.md", "usr/share/doc/liuguang/CONFIGURATION.md", "644"],
+  ["../../docs/USAGE.md", "usr/share/doc/liuguang/USAGE.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+  { source = "target/release/liuguang", dest = "/usr/bin/liuguang", mode = "755" },
+  { source = "packaging/liuguang.service", dest = "/usr/lib/systemd/system/liuguang.service", mode = "644" },
+  { source = "packaging/liuguang-user.service", dest = "/usr/lib/systemd/user/liuguang.service", mode = "644" },
+  { source = "packaging/liuguang.preset", dest = "/usr/lib/systemd/system-preset/90-liuguang.preset", mode = "644" },
+  { source = "packaging/liuguang.sysusers", dest = "/usr/lib/sysusers.d/liuguang.conf", mode = "644" },
+  { source = "packaging/liuguang.tmpfiles", dest = "/usr/lib/tmpfiles.d/liuguang.conf", mode = "644" },
+  { source = "config/example.toml", dest = "/etc/liuguang/config.toml", mode = "644", config = true },
+  { source = "scripts/install.sh", dest = "/usr/share/doc/liuguang/install.sh", mode = "755" },
+  { source = "scripts/install-user-session.sh", dest = "/usr/share/doc/liuguang/install-user-session.sh", mode = "755" },
+  { source = "README.md", dest = "/usr/share/doc/liuguang/README.md", mode = "644", doc = true },
+  { source = "docs/DEPLOYMENT.md", dest = "/usr/share/doc/liuguang/DEPLOYMENT.md", mode = "644", doc = true },
+  { source = "docs/CONFIGURATION.md", dest = "/usr/share/doc/liuguang/CONFIGURATION.md", mode = "644", doc = true },
+  { source = "docs/USAGE.md", dest = "/usr/share/doc/liuguang/USAGE.md", mode = "644", doc = true },
+  { source = "LICENSE", dest = "/usr/share/licenses/liuguang/LICENSE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+libdrm = "*"
+wayland-libs = "*"
+mesa-libgbm = "*"
+gstreamer1 = "*"
+gstreamer1-plugins-base = "*"
+gstreamer1-plugins-good = "*"
+gstreamer1-plugins-bad-free = "*"
+systemd = "*"

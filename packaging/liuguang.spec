@@ -146,7 +146,6 @@ fi
 %{_docdir}/liuguang/install-user-session.sh
 %{_docdir}/liuguang/build-gui.sh
 %{_bindir}/liuguang
-%{_bindir}/liuguang
 %{_unitdir}/liuguang.service
 %{_sysusersdir}/liuguang.conf
 %{_prefix}/lib/systemd/system-preset/90-liuguang.preset
@@ -161,7 +160,6 @@ fi
 %dir %attr(2770,liuguang,liuguang-ctl) /srv/wallpapers/videos
 
 %files -n liuguangctl
-%{_bindir}/liuguangctl
 %{_bindir}/liuguangctl
 
 %changelog

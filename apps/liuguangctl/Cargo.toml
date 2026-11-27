@@ -25,3 +25,20 @@ tracing.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.deb]
+maintainer = "suluoMISS <suluoMISS@users.noreply.github.com>"
+copyright = "2026, suluoMISS (Liuguang Contributors)"
+license-file = ["../../LICENSE", "0"]
+section = "utils"
+priority = "optional"
+depends = "libc6"
+assets = [
+  ["target/release/liuguangctl", "usr/bin/liuguangctl", "755"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+  { source = "target/release/liuguangctl", dest = "/usr/bin/liuguangctl", mode = "755" },
+  { source = "LICENSE", dest = "/usr/share/licenses/liuguangctl/LICENSE", mode = "644", doc = true },
+]

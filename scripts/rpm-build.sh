@@ -40,7 +40,11 @@ echo "[rpm-build] $NAME $VERSION  topdir=$TOPDIR"
 VENDOR_DIR="$ROOT/.rpm-vendor"
 if [ ! -d "$VENDOR_DIR" ] || [ -z "$(ls -A "$VENDOR_DIR" 2>/dev/null)" ]; then
     echo "[rpm-build] 生成 .rpm-vendor/（cargo vendor；需要 registry 缓存或外网）"
-    CARGO_HOME="${CARGO_HOME:-$ROOT/.cargo-home}" cargo vendor "$VENDOR_DIR" >/dev/null
+    VENDOR_ARGS=()
+    if [ "${CARGO_NET_OFFLINE:-false}" = "true" ]; then
+        VENDOR_ARGS+=(--offline)
+    fi
+    CARGO_HOME="${CARGO_HOME:-$ROOT/.cargo-home}" cargo vendor "${VENDOR_ARGS[@]}" "$VENDOR_DIR" >/dev/null
 fi
 echo "[rpm-build] .rpm-vendor/ = $(du -sh "$VENDOR_DIR" | cut -f1)"
 
@@ -55,8 +59,13 @@ for item in Cargo.toml Cargo.lock LICENSE README.md crates apps config packaging
     [ -e "$ROOT/$item" ] || { echo "[rpm-build] 缺少 $item" >&2; exit 1; }
     cp -a "$ROOT/$item" "$PKGDIR/"
 done
-# packaging/npm 下的预编译二进制不属于源码包
-rm -rf "$PKGDIR/packaging/npm/vendor" "$PKGDIR/packaging/npm/scripts"
+mkdir -p "$PKGDIR/scripts"
+for script in install.sh install-user-session.sh build-gui.sh gen-outputs-config.sh; do
+    [ -e "$ROOT/scripts/$script" ] || { echo "[rpm-build] 缺少 scripts/$script" >&2; exit 1; }
+    cp -a "$ROOT/scripts/$script" "$PKGDIR/scripts/"
+done
+# 内部归档与旧版 npm 目录不属于源码包
+rm -rf "$PKGDIR/packaging/npm" "$PKGDIR/docs/archive"
 # 构建产物不属于源码包：GUI 是独立 workspace，apps/liuguang-gui/target 可达数百 MB
 find "$PKGDIR" -depth -type d -name target -prune -exec rm -rf {} +
 
