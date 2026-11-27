@@ -22,7 +22,8 @@ in
 
     gui = {
       enable = lib.mkEnableOption "liuguang-gui 图形界面" // {
-        default = true;
+        # 无头形态（persona = "system"）默认不装 GTK GUI。
+        default = cfg.persona == "user";
       };
       package = lib.mkOption {
         type = lib.types.package;
@@ -46,7 +47,9 @@ in
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ cfg.package ] ++ lib.optional cfg.gui.enable cfg.gui.package;
     systemd.packages = [ cfg.package ];
-    systemd.tmpfiles.packages = [ cfg.package ];
+    # tmpfiles 规则里的 /srv/wallpapers 归 liuguang:liuguang-ctl 所有，而这两个账户
+    # 只在本模块的 system 人格下创建；user 人格装上会报 "Failed to resolve user"，故按需启用。
+    systemd.tmpfiles.packages = lib.optional (cfg.persona == "system") cfg.package;
     hardware.graphics.enable = lib.mkDefault true;
 
     systemd.user.services.liuguang.wantedBy = lib.mkIf (cfg.persona == "user") [

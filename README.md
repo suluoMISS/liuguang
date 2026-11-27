@@ -184,11 +184,18 @@ NixOS（flake）：
 
 ```nix
 inputs.liuguang.url = "github:suluoMISS/liuguang";
-# modules = [ inputs.liuguang.nixosModules.default ];
+modules = [ inputs.liuguang.nixosModules.default ];
 services.liuguang = {
   enable = true;
   persona = "user";   # 桌面 Wayland 壁纸层；无头 DRM/KMS 用 "system"
 };
+```
+
+`persona = "system"`（无头）会创建 `liuguang` 用户与 `liuguang-ctl` 组；想让某个用户能用
+`liuguangctl`，需自行加入该组：
+
+```nix
+users.users.你的用户名.extraGroups = [ "liuguang-ctl" ];
 ```
 
 也可用 `overlays.default` 获得 `pkgs.liuguang` / `pkgs.liuguang-gui`；`nix develop` 进入开发环境。
