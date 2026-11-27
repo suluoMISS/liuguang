@@ -6,7 +6,7 @@
 #   若日后需要调试符号，删掉这行并加 BuildRequires: rust-debugger-common。
 
 Name:           liuguang
-Version:        0.3.2
+Version:        0.3.3
 Release:        1%{?dist}
 Summary:        Dynamic wallpaper engine: Wayland layer (desktop) and DRM/KMS (headless)
 
@@ -163,6 +163,12 @@ fi
 %{_bindir}/liuguangctl
 
 %changelog
+* Fri Nov 27 2026 Liuguang Maintainers <maintainers@liuguang.invalid> - 0.3.3-1
+- vaapi/convert: fix R/B swap on Mesa/Intel (UvDialect::Gr88 swaps_uv=false) and calibrate dual-GPU color
+- vaapi/display/wayland: negotiate compositor DMA-BUF modifiers before GBM allocation; wait cfg_ready, clamp 24.8 viewport source, tolerance on fractional scaling, and pool_id release guard
+- daemon/game_watch: break DMA-BUF reopen loop (respect force_cpu and per-node verification), filter Wine helpers (xalia.exe/iexplore.exe), skip disabled fullscreen outputs, and flush state/config cleanly
+- gui: preserve edits/outputs on periodic sync, clear pending/last_error on completion or failure, cache theme accent CSS, debounce disconnect notices, and fix reload/sources race
+
 * Fri Nov 27 2026 Liuguang Maintainers <maintainers@liuguang.invalid> - 0.3.2-1
 - power_watch: ignore peripheral Device batteries (mouse/keyboard/headset)
 - wayland: discover wayland-<num> sockets under XDG_RUNTIME_DIR when WAYLAND_DISPLAY is empty

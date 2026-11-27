@@ -377,6 +377,9 @@ pub enum FrameError {
         /// 需要长度。
         need: u64,
     },
+    /// 像素格式不支持该操作。
+    #[error("不支持的像素格式: {0:?}")]
+    UnsupportedFormat(PixelFormat),
 }
 
 /// `present` 的受理令牌。返回它只代表提交已受理；

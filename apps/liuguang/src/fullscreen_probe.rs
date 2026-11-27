@@ -68,11 +68,14 @@ pub fn probe(target: &FullscreenToplevel) -> Probe {
         return Probe::WindowGone;
     };
     let size = window_size(&item);
-    let Some(cover) = largest_output_logical(&outputs) else {
+    let logical_sizes = enabled_output_logicals(&outputs);
+    if logical_sizes.is_empty() {
         return Probe::Unknown;
-    };
+    }
     match size {
-        Some((w, h)) if covers(w, h, cover.0, cover.1) => Probe::StillFullscreen,
+        Some((w, h)) if logical_sizes.iter().any(|&(ow, oh)| covers(w, h, ow, oh)) => {
+            Probe::StillFullscreen
+        }
         Some(_) => Probe::Exited,
         None => Probe::Unknown,
     }
@@ -113,24 +116,33 @@ fn window_size(item: &serde_json::Value) -> Option<(f64, f64)> {
     Some((w, h))
 }
 
-/// 所有输出里最大的那个逻辑尺寸（多显示器时全屏窗口只会覆盖其中之一）。
-fn largest_output_logical(outputs: &serde_json::Value) -> Option<(f64, f64)> {
-    let map = outputs.as_object()?;
-    let mut best: Option<(f64, f64)> = None;
+/// 收集所有已启用输出的逻辑尺寸（跳过 `logical: null` 的禁用输出）。
+fn enabled_output_logicals(outputs: &serde_json::Value) -> Vec<(f64, f64)> {
+    let Some(map) = outputs.as_object() else {
+        return Vec::new();
+    };
+    let mut list = Vec::new();
     for output in map.values() {
-        let logical = output.get("logical")?;
-        let w = logical.get("width")?.as_f64()?;
-        let h = logical.get("height")?.as_f64()?;
-        best = match best {
-            Some((bw, bh)) if bw * bh >= w * h => Some((bw, bh)),
-            _ => Some((w, h)),
+        let Some(logical) = output.get("logical").and_then(|v| v.as_object()) else {
+            continue;
         };
+        let (Some(w), Some(h)) = (
+            logical.get("width").and_then(|v| v.as_f64()),
+            logical.get("height").and_then(|v| v.as_f64()),
+        ) else {
+            continue;
+        };
+        list.push((w, h));
     }
-    best
+    list
 }
 
 /// 跑一条 `niri …` 命令并解析 JSON；超时/失败/非 UTF-8 都返回 `None`。
+///
+/// 通过辅助线程排空 stdout 避免 64KiB 管道缓冲区写满导致子进程阻塞。
 fn run_json(args: &[&str]) -> Option<serde_json::Value> {
+    use std::io::Read as _;
+
     let mut child = Command::new("niri")
         .args(args)
         .stdin(Stdio::null())
@@ -138,23 +150,33 @@ fn run_json(args: &[&str]) -> Option<serde_json::Value> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
     let deadline = Instant::now() + PROBE_TIMEOUT;
     loop {
         match child.try_wait().ok()? {
             Some(status) if status.success() => break,
-            Some(_) => return None,
+            Some(_) => {
+                let _ = reader.join();
+                return None;
+            }
             None => {}
         }
         if Instant::now() >= deadline {
             // 探测卡住时不能拖住主循环：杀掉子进程，按"不知道"处理。
             let _ = child.kill();
             let _ = child.wait();
+            let _ = reader.join();
             return None;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let output = child.wait_with_output().ok()?;
-    serde_json::from_slice(&output.stdout).ok()
+    let bytes = reader.join().ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 #[cfg(test)]
@@ -199,18 +221,22 @@ mod tests {
     }
 
     #[test]
-    fn largest_output_wins_among_multiple_displays() {
+    fn enabled_outputs_collect_all_active_displays_and_skip_disabled() {
         let outputs = serde_json::json!({
             "eDP-1": {"logical": {"width": 1706.0, "height": 1066.0}},
-            "HDMI-A-1": {"logical": {"width": 2560.0, "height": 1440.0}}
+            "HDMI-A-1": {"logical": {"width": 2560.0, "height": 1440.0}},
+            "DP-DISABLED": {"logical": null}
         });
-        assert_eq!(largest_output_logical(&outputs), Some((2560.0, 1440.0)));
+        let got = enabled_output_logicals(&outputs);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.contains(&(1706.0, 1066.0)));
+        assert!(got.contains(&(2560.0, 1440.0)));
     }
 
     #[test]
     fn missing_fields_are_unknown_not_fuller_screen() {
         assert_eq!(window_size(&serde_json::json!({"id": 1})), None);
-        assert_eq!(largest_output_logical(&serde_json::json!({})), None);
+        assert!(enabled_output_logicals(&serde_json::json!({})).is_empty());
         assert_eq!(
             find_window(&serde_json::json!({"not": "a list"}), &target("x", None)),
             None

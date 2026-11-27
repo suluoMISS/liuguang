@@ -148,7 +148,9 @@ pub struct App {
     /// 上一次 Status 的指纹：只有变化才重刷界面，避免空闲时每秒重布局。
     pub last_status_key: RefCell<String>,
     /// 转码完成后被推迟的重试：等一次新的 `Status` 再决定（先看 daemon 是否已自动播缓存）。
-    pub deferred_retry: RefCell<Option<(String, Option<String>)>>,
+    pub deferred_retry: RefCell<Option<(String, Option<String>, Instant)>>,
+    /// 最近一次应用的流光主题强调色（未变化时不重复重载全局 CSS）。
+    pub last_accent: RefCell<Option<(u8, u8, u8)>>,
     /// 截图/演示：启动后自动准备的目标（名称或路径），只触发一次。
     pub demo_prepare: Option<String>,
     /// `demo_prepare` 是否已触发。
@@ -429,7 +431,23 @@ impl App {
 
     /// 把某个媒体应用到指定输出（显示器页"一键应用"）。
     pub fn apply_media_to_output(self: &Rc<Self>, path: &str, output: Option<&str>) {
-        self.record_history(path);
+        self.apply_media_to_output_inner(path, output, true);
+    }
+
+    /// 历史回退专用：切换到上一张但不把当前壁纸重新压回历史栈。
+    pub fn apply_media_to_output_no_history(self: &Rc<Self>, path: &str, output: Option<&str>) {
+        self.apply_media_to_output_inner(path, output, false);
+    }
+
+    fn apply_media_to_output_inner(
+        self: &Rc<Self>,
+        path: &str,
+        output: Option<&str>,
+        record: bool,
+    ) {
+        if record {
+            self.record_history(path);
+        }
         let (fit, zoom, offset_x, offset_y, rotation, brightness) = {
             let state = self.state.borrow();
             let config = state.config.as_ref();
@@ -1113,6 +1131,7 @@ fn build_ui(gtk_app: &adw::Application, args: Args) {
         probe_notice_shown: Cell::new(false),
         last_status_key: RefCell::new(String::new()),
         deferred_retry: RefCell::new(None),
+        last_accent: RefCell::new(None),
         demo_prepare: args.demo_prepare.clone(),
         demo_prepare_done: Cell::new(false),
         demo_apply: args.demo_apply.clone(),
@@ -1389,7 +1408,7 @@ fn build_ui(gtk_app: &adw::Application, args: Args) {
                     let previous = app.history.borrow_mut().pop();
                     match previous {
                         Some(path) => {
-                            app.apply_media_to_output(&path, None);
+                            app.apply_media_to_output_no_history(&path, None);
                             app.toast("已回到上一张壁纸");
                         }
                         None => app.toast("没有更早的壁纸可回退"),
@@ -1846,16 +1865,24 @@ fn handle_update(app: &Rc<App>, update: Upd) {
                     app.apply_watch.borrow_mut().take();
                 }
             }
-            // 转码完成后的重试等到这里才做：先看新状态里 daemon 是不是已经自动播了缓存。
-            if let Some((path, cache)) = app.deferred_retry.borrow_mut().take() {
-                if already_playing(app, &path, cache.as_deref()) {
-                    app.auto_apply.borrow_mut().take();
-                    app.toast(&format!(
-                        "已转换为 {}，daemon 已自动播放缓存副本",
-                        converted_target(app, &path)
-                    ));
-                } else {
-                    maybe_retry_after_prepare(app, &path);
+            // 转码完成后的重试等到这里才做：先看新状态里 daemon 是不是已经自动播了缓存
+            // （必须等到 scheduled `ready_at` 之后，避免 1s 心跳 Status 抢先消费）。
+            let retry_due = app
+                .deferred_retry
+                .borrow()
+                .as_ref()
+                .is_some_and(|(_, _, ready_at)| Instant::now() >= *ready_at);
+            if retry_due {
+                if let Some((path, cache, _)) = app.deferred_retry.borrow_mut().take() {
+                    if already_playing(app, &path, cache.as_deref()) {
+                        app.auto_apply.borrow_mut().take();
+                        app.toast(&format!(
+                            "已转换为 {}，daemon 已自动播放缓存副本",
+                            converted_target(app, &path)
+                        ));
+                    } else {
+                        maybe_retry_after_prepare(app, &path);
+                    }
                 }
             }
         }
@@ -1966,6 +1993,7 @@ fn handle_update(app: &Rc<App>, update: Upd) {
             }
         }
         Upd::Applied(path) => {
+            app.state.borrow_mut().last_error = None;
             let name = app
                 .state
                 .borrow()
@@ -1976,11 +2004,14 @@ fn handle_update(app: &Rc<App>, update: Upd) {
             app.toast_hint(&format!("已切换：{name}"), &path);
             app.status_left.set_text(&format!("已切换：{name}"));
             app.apply_watch.borrow_mut().take();
+            update_statusbar(app);
             app.send(Cmd::Status);
         }
         Upd::TransformApplied => {}
         Upd::Paused(paused) => {
+            app.state.borrow_mut().last_error = None;
             app.toast(if paused { "已暂停" } else { "已继续" });
+            update_statusbar(app);
             app.send(Cmd::Status);
         }
         Upd::Pinned(pinned) => {
@@ -2049,6 +2080,8 @@ fn handle_update(app: &Rc<App>, update: Upd) {
         }
         Upd::Notice(message) => app.toast(&message),
         Upd::Reloaded => {
+            app.state.borrow_mut().last_error = None;
+            update_statusbar(app);
             app.send(Cmd::Status);
             app.send(Cmd::Media);
             app.send(Cmd::Config);
@@ -2082,6 +2115,12 @@ fn handle_update(app: &Rc<App>, update: Upd) {
                 refresh_details(app);
             }
         }
+        Upd::CompatFailed(id) => {
+            app.compat_pending.borrow_mut().remove(&id);
+        }
+        Upd::ThumbFailed { id, at_ms } => {
+            app.pending.borrow_mut().remove(&(id, at_ms));
+        }
         Upd::Prepared { path, result } => {
             let state = result.state;
             let message = result.message.clone().unwrap_or_default();
@@ -2093,7 +2132,8 @@ fn handle_update(app: &Rc<App>, update: Upd) {
             }
             match state {
                 PrepareState::Ready => {
-                    // 角标/详情跟着变（缓存就绪后 daemon 会透明地播缓存副本）。
+                    // 角标/详情跟着变（先清旧 compat 缓存，否则 request_compat 会直接跳过）。
+                    app.compat.borrow_mut().remove(&path);
                     app.request_compat(&path);
                     if already_playing(app, &path, cache_path.as_deref()) {
                         // t18 F5：daemon 已经自动播了缓存副本，再发 set_wallpaper 会重复建通道。
@@ -2171,6 +2211,7 @@ fn handle_update(app: &Rc<App>, update: Upd) {
                         path: media.clone(),
                         force: false,
                     });
+                    app.compat.borrow_mut().remove(&media);
                     app.request_compat(&media);
                     if already_playing(app, &media, event.cache_path.as_deref()) {
                         // daemon 已经自动应用了缓存副本：只更新界面，别再发一次 set_wallpaper。
@@ -2363,7 +2404,11 @@ fn schedule_retry_after_prepare(app: &Rc<App>, path: &str, cache: Option<String>
     if app.deferred_retry.borrow().is_some() {
         return;
     }
-    *app.deferred_retry.borrow_mut() = Some((path.to_owned(), cache));
+    *app.deferred_retry.borrow_mut() = Some((
+        path.to_owned(),
+        cache,
+        Instant::now() + Duration::from_millis(650),
+    ));
     let weak = Rc::downgrade(app);
     glib::timeout_add_local_once(Duration::from_millis(700), move || {
         if let Some(app) = weak.upgrade() {
@@ -2567,7 +2612,11 @@ fn sync_liuguang_theme(app: &Rc<App>, id: &str) {
         app.request_thumb(id, 0);
     }
     if let Some(&accent) = app.thumb_accents.borrow().get(id) {
-        ui::update_liuguang_css(accent);
+        let mut last = app.last_accent.borrow_mut();
+        if *last != Some(accent) {
+            *last = Some(accent);
+            ui::update_liuguang_css(accent);
+        }
     }
 }
 

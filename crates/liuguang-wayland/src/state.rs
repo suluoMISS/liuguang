@@ -57,6 +57,7 @@ pub(crate) struct FrameUdata(pub u32);
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BufferUdata {
     pub global: u32,
+    pub pool_id: u64,
     pub slot: u32,
     /// 槽属于哪个池：整屏合成池还是快路径帧池（释放事件必须回到同一个池，
     /// 否则帧池槽位永远处于 busy，几十帧后必然「空槽竞争丢失」）。
@@ -492,7 +493,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WlState {
                     }
                     entry.pool = None; // Pool Drop 自行 destroy+munmap
                     entry.frame_pool = None;
-                    if entry.output.is_alive() {
+                    if entry.output.is_alive() && entry.output.version() >= 3 {
                         entry.output.release();
                     }
                 }
@@ -788,7 +789,7 @@ impl Dispatch<wl_buffer::WlBuffer, BufferUdata> for WlState {
                 } else {
                     entry.pool.as_mut()
                 };
-                if let Some(pool) = pool {
+                if let Some(pool) = pool.filter(|p| p.id() == udata.pool_id) {
                     pool.release_slot(udata.slot);
                 }
             }

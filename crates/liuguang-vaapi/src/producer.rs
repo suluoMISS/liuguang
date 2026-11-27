@@ -149,6 +149,10 @@ struct SyncPipeline {
     visible: (u32, u32),
     /// 期望的 RGB 输出尺寸（显示器物理像素）：建转换器时直接按此分配，避免首帧后再重建。
     output_size: Option<(u32, u32)>,
+    /// 合成器广播的 `XRGB8888` 首选 modifier 列表（传给 `RgbConverter` 分配输出 BO）。
+    rgb_modifiers: Vec<u64>,
+    /// 跨线程共享的 RGB 输出槽位占用计数。
+    slot_inflight: Arc<AtomicUsize>,
     /// 实时几何与亮度参数（仅 RGB 路径由 GPU 着色器直接消费）。
     render_transform: RenderTransform,
     /// 导出帧计数（与生产者共享：预读线程会继续加）。
@@ -295,7 +299,15 @@ impl SyncPipeline {
             return Ok(());
         }
         let (out_w, out_h) = self.output_size.unwrap_or((width, height));
-        let mut converter = RgbConverter::new_with_output(&node, width, height, out_w, out_h)?;
+        let mut converter = RgbConverter::new_with_output_and_modifiers(
+            &node,
+            width,
+            height,
+            out_w,
+            out_h,
+            &self.rgb_modifiers,
+        )?;
+        converter.set_inflight_counter(Arc::clone(&self.slot_inflight));
         converter.set_visible_size(self.visible.0, self.visible.1);
         converter.set_render_transform(self.render_transform);
         tracing::info!(
@@ -735,9 +747,10 @@ impl Prefetch {
             Err(TryRecvError::Empty) => Ok(VideoPoll::NeedMore),
             Err(TryRecvError::Disconnected) => {
                 self.finished = true;
-                // 线程已退出：先把管线收回来（在调用方线程析构），再 join 拿 panic 信息。
+                // 必须先 join 等工作线程把管线放回回收通道，再取回并在调用方线程析构（t43）。
+                let panic_reason = self.join_after_exit();
                 self.take_returned();
-                match self.join_after_exit() {
+                match panic_reason {
                     Some(reason) => Err(liuguang_media::MediaError::Decode(format!(
                         "解码预读线程异常退出: {reason}"
                     ))),
@@ -827,6 +840,7 @@ fn run_prefetch_worker(
     ctl: Arc<PrefetchControl>,
 ) {
     let mut loops: u64 = 0;
+    let mut empty_segments: u32 = 0;
     loop {
         if !ctl.wait_until_runnable() {
             return;
@@ -838,6 +852,7 @@ fn run_prefetch_worker(
                 frame,
                 capture,
             }) => {
+                empty_segments = 0;
                 if !send_event(
                     &tx,
                     &ctl,
@@ -855,6 +870,17 @@ fn run_prefetch_worker(
             // （队列里还有 3 帧缓冲，够 50ms 的余量）。
             Ok(PrefetchStep::Throttled) => std::thread::park_timeout(THROTTLE_POLL),
             Ok(PrefetchStep::EndOfSegment) => {
+                empty_segments = empty_segments.saturating_add(1);
+                if empty_segments >= 2 {
+                    let _ = send_event(
+                        &tx,
+                        &ctl,
+                        PrefetchEvent::Failed(
+                            "循环重播连续无帧产出（空视频流或 seek 后无数据）".to_string(),
+                        ),
+                    );
+                    return;
+                }
                 loops = loops.saturating_add(1);
                 tracing::debug!(loops, "解码预读线程到达流末尾：自行 seek 回起点继续");
                 // 先把边界事件交给消费者（FIFO 保证它在旧帧之后），再 seek：
@@ -903,12 +929,16 @@ pub struct VaapiProducer {
     exported: Arc<AtomicU64>,
     /// 未归还的解码表面数（与预读线程共享，非 RGB 路径背压）。
     surface_inflight: Arc<AtomicUsize>,
+    /// 未归还的 RGB 输出槽位数（与预读线程和 `RgbConverter` 共享）。
+    slot_inflight: Arc<AtomicUsize>,
     /// 预读深度（通道容量）。
     depth: usize,
     /// 是否已请求逐帧回读（诊断探针）。
     capture: bool,
     /// RGB 转换模式（`open_rgb` 建立）。
     rgb: bool,
+    /// 预读线程尚未启动前若收到 `set_playing(false)`，启动线程时保持暂停。
+    start_paused: bool,
     /// 管线：同步 / 预读线程接管。
     pipeline: Option<Pipeline>,
 }
@@ -946,12 +976,15 @@ impl VaapiProducer {
         };
         let exported = Arc::new(AtomicU64::new(0));
         let surface_inflight = Arc::new(AtomicUsize::new(0));
+        let slot_inflight = Arc::new(AtomicUsize::new(0));
         let pipeline = SyncPipeline {
             decoder,
             converter: None,
             rgb_node: None,
             visible: (0, 0),
             output_size: None,
+            rgb_modifiers: Vec::new(),
+            slot_inflight: Arc::clone(&slot_inflight),
             render_transform: RenderTransform::default(),
             exported: Arc::clone(&exported),
             surface_inflight: Arc::clone(&surface_inflight),
@@ -961,9 +994,11 @@ impl VaapiProducer {
             node: render_node.to_path_buf(),
             exported,
             surface_inflight,
+            slot_inflight,
             depth,
             capture: false,
             rgb: false,
+            start_paused: false,
             pipeline: Some(Pipeline::Local(Box::new(pipeline))),
         })
     }
@@ -978,6 +1013,15 @@ impl VaapiProducer {
     ///
     /// 解码器打不开或 EGL/gbm 初始化失败时返回 [`liuguang_media::MediaError`]。
     pub fn open_rgb(path: &Path, render_node: &Path) -> Result<Self, liuguang_media::MediaError> {
+        Self::open_rgb_with_modifiers(path, render_node, &[])
+    }
+
+    /// 同 [`Self::open_rgb`]，并把合成器广播的 `XRGB8888` modifier 列表传给 GBM 输出分配器。
+    pub fn open_rgb_with_modifiers(
+        path: &Path,
+        render_node: &Path,
+        preferred_modifiers: &[u64],
+    ) -> Result<Self, liuguang_media::MediaError> {
         let mut producer = Self::open(path, render_node)?;
         let (width, height) = (producer.info.width, producer.info.height);
         tracing::info!(
@@ -985,6 +1029,7 @@ impl VaapiProducer {
             node = %render_node.display(),
             width,
             height,
+            preferred_modifiers = preferred_modifiers.len(),
             "RGB 转换管线已就绪（转换器等第一帧的解码表面尺寸再建：NV12 → XRGB8888，零拷贝输出）"
         );
         let Some(pipeline) = producer.local_mut() else {
@@ -994,6 +1039,7 @@ impl VaapiProducer {
         };
         pipeline.rgb_node = Some(render_node.to_path_buf());
         pipeline.visible = (width, height);
+        pipeline.rgb_modifiers = preferred_modifiers.to_vec();
         producer.rgb = true;
         Ok(producer)
     }
@@ -1028,10 +1074,7 @@ impl VaapiProducer {
             tracing::info!("解码预读已关闭（LIUGUANG_VIDEO_PREFETCH=0），保持同步解码路径");
             return;
         }
-        let slot_inflight = self.pipeline.as_ref().and_then(|pipeline| match pipeline {
-            Pipeline::Local(local) => local.converter.as_ref().map(RgbConverter::inflight_handle),
-            Pipeline::Prefetch(_) => None,
-        });
+        let slot_inflight = self.rgb.then(|| Arc::clone(&self.slot_inflight));
         let spawned = Prefetch::spawn(self.depth, slot_inflight, self.capture);
         let (mut prefetch, handoff) = match spawned {
             Ok(spawned) => spawned,
@@ -1043,6 +1086,9 @@ impl VaapiProducer {
                 return;
             }
         };
+        if self.start_paused {
+            prefetch.ctl.pause();
+        }
         let Some(pipeline) = self.take_local() else {
             return;
         };
@@ -1178,6 +1224,7 @@ impl FrameProducer for VaapiProducer {
     /// 暂停必须**立刻停手**（硬指标：暂停时 CPU ≤1%）：置标志 + `unpark`，
     /// 线程在 1ms 内停下，连解码都不再发起。
     fn set_playing(&mut self, playing: bool) -> Result<(), liuguang_media::MediaError> {
+        self.start_paused = !playing;
         if let Some(Pipeline::Prefetch(prefetch)) = self.pipeline.as_ref() {
             if playing {
                 prefetch.ctl.resume();

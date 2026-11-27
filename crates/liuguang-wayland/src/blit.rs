@@ -47,6 +47,7 @@ pub(crate) fn write_frame(
 ) -> Result<(), DisplayError> {
     let (src_x, src_y, src_w, src_h) = src;
     let (rect_x, rect_y, rect_w, rect_h) = dst_rect;
+    frame.validate().map_err(DisplayError::InvalidFrame)?;
 
     if src_w == 0
         || src_h == 0
@@ -307,7 +308,13 @@ mod tests {
 
     #[test]
     fn nv12_is_rejected() {
-        let f = frame(2, 1, PixelFormat::Nv12, [0; 4]);
+        let f = CpuFrame {
+            width: 4,
+            height: 2,
+            stride: 4,
+            format: PixelFormat::Nv12,
+            data: Arc::from(vec![0u8; 4 * 2 * 3 / 2].into_boxed_slice()),
+        };
         let mut dst = vec![0u8; 8];
         let err = write_frame(
             &mut dst,
@@ -315,7 +322,7 @@ mod tests {
             2,
             1,
             &f,
-            (0, 0, 2 << 16, 1 << 16),
+            (0, 0, 4 << 16, 2 << 16),
             (0, 0, 2, 1),
         )
         .unwrap_err();

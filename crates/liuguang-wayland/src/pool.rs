@@ -14,6 +14,7 @@
 #![allow(unsafe_code)]
 
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use wayland_client::{
     Proxy, QueueHandle,
@@ -26,6 +27,8 @@ use super::sys;
 /// 池内槽位数。
 pub(crate) const SLOT_COUNT: u32 = 3;
 
+static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
+
 struct Slot {
     buffer: wl_buffer::WlBuffer,
     busy: bool,
@@ -34,6 +37,7 @@ struct Slot {
 /// 一个输出专属的共享内存池。不可 `Send`（wayland 代理跨线程语义由
 /// wayland-backend 保证，但本后端是单线程使用，见 `WaylandBackend`）。
 pub(crate) struct Pool {
+    pool_id: u64,
     /// memfd 所有权句柄：仅用于持有（fd 已交给 wl_shm，但映射在
     /// `Drop`（munmap → close）前必须保持文件打开）。
     #[allow(dead_code)] // 所有权字段，构造后不再读取
@@ -97,6 +101,7 @@ impl Pool {
         let ptr =
             sys::mmap_shared_rw(file.as_raw_fd(), len).map_err(|e| format!("mmap 失败: {e}"))?;
 
+        let pool_id = NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed);
         // BorrowedFd 借用只存在于本次调用；fd 所有权仍在 `file`。
         let pool = shm.create_pool(file.as_fd(), len as i32, qh, ());
         let mut slots = Vec::with_capacity(SLOT_COUNT as usize);
@@ -114,6 +119,7 @@ impl Pool {
                 qh,
                 BufferUdata {
                     global,
+                    pool_id,
                     slot,
                     frame_pool,
                 },
@@ -124,6 +130,7 @@ impl Pool {
             });
         }
         Ok(Self {
+            pool_id,
             file,
             ptr,
             len,
@@ -134,6 +141,10 @@ impl Pool {
             pool,
             slots,
         })
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.pool_id
     }
 
     /// 池尺寸（像素）。

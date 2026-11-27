@@ -22,7 +22,7 @@
 
 pkgbase=liuguang
 pkgname=liuguang
-pkgver=0.3.2
+pkgver=0.3.3
 pkgrel=1
 pkgdesc='Linux 动态壁纸（桌面 Wayland 壁纸层 / 无头 DRM-KMS）'
 arch=('x86_64' 'aarch64')

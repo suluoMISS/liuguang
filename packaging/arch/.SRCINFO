@@ -1,6 +1,6 @@
 pkgbase = liuguang
 	pkgdesc = Linux 动态壁纸（桌面 Wayland 壁纸层 / 无头 DRM-KMS）
-	pkgver = 0.3.2
+	pkgver = 0.3.3
 	pkgrel = 1
 	url = https://github.com/suluoMISS/liuguang
 	install = liuguang.install

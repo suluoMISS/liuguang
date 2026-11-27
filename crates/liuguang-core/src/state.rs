@@ -199,6 +199,7 @@ const fn next_state(from: State, event: Event) -> Option<State> {
         (S::Paused, E::SwitchRequested) => Some(S::PreparingNext),
         (S::Paused, E::OutputLost) => Some(S::HeadlessReady),
         (S::Paused, E::VtSuspended) => Some(S::Suspended),
+        (S::Paused, E::ErrorOccurred) => Some(S::DegradedStatic),
         // HeadlessReady
         (S::HeadlessReady, E::OutputConnected) => Some(S::InitializingDisplay),
         (S::HeadlessReady, E::VtSuspended) => Some(S::Suspended),
@@ -584,5 +585,17 @@ mod tests {
         sm.handle(Event::SwitchRequested).unwrap();
         assert_eq!(sm.current(), State::PreparingNext);
         assert_eq!(sm.handle(Event::StaticShown).unwrap().to, State::StaticIdle);
+    }
+
+    #[test]
+    fn error_while_paused_enters_degraded_static() {
+        let mut sm = StateMachine::new();
+        sm.handle(Event::DisplayInitialized).unwrap();
+        sm.handle(Event::StaticShown).unwrap();
+        assert_eq!(sm.handle(Event::Pause).unwrap().to, State::Paused);
+        assert_eq!(
+            sm.handle(Event::ErrorOccurred).unwrap().to,
+            State::DegradedStatic
+        );
     }
 }

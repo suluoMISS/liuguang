@@ -1,6 +1,6 @@
 pkgbase = liuguang-gui
 	pkgdesc = Liuguang 的 GTK4 图形界面（挑选媒体、适配/缩放/偏移、目标输出、转场）
-	pkgver = 0.3.2
+	pkgver = 0.3.3
 	pkgrel = 1
 	url = https://github.com/suluoMISS/liuguang
 	arch = x86_64

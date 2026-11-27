@@ -32,6 +32,7 @@ use std::io::{BufRead, BufReader};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -384,6 +385,7 @@ struct Job {
     message: Option<String>,
     spec: JobSpec,
     started_at: Option<Instant>,
+    cancel: Arc<AtomicBool>,
 }
 
 /// 后台转码器（单线程 worker + 队列；`Runtime` 每 tick 调 [`Transcoder::poll`]）。
@@ -568,6 +570,30 @@ impl Transcoder {
         TranscodeProfile::for_consumer(&self.profile_spec, self.profile_max_width, consumer)
     }
 
+    /// 热重载转码配置，保留进行中的任务与缓存状态。
+    pub fn reconfigure(
+        &mut self,
+        config_value: &str,
+        env_value: Option<&str>,
+        profile_spec: &str,
+        max_width: u32,
+        consumer: DecodeConsumer,
+    ) {
+        let policy = TranscodePolicy::resolve(config_value, env_value);
+        let program = match &policy {
+            TranscodePolicy::Off => None,
+            TranscodePolicy::Auto => find_in_path("ffmpeg"),
+            TranscodePolicy::Program(path) => Some(path.clone()),
+        };
+        self.policy = policy;
+        self.program = program;
+        self.config_value = config_value.to_string();
+        self.env_override = env_value.map(str::to_string);
+        self.profile_spec = profile_spec.to_string();
+        self.profile_max_width = max_width;
+        self.profile = TranscodeProfile::for_consumer(profile_spec, max_width, consumer);
+    }
+
     /// 找不到 ffmpeg 时的可操作提示。
     pub fn missing_ffmpeg_message(&self) -> String {
         "未找到 ffmpeg，无法自动转换硬件解不动的素材（8K H.264 / 10bit HEVC）：\
@@ -635,6 +661,7 @@ impl Transcoder {
                     message: Some(message.clone()),
                     spec,
                     started_at: None,
+                    cancel: Arc::new(AtomicBool::new(false)),
                 },
             );
             return JobView {
@@ -657,8 +684,14 @@ impl Transcoder {
                 source = %source.display(),
                 "源文件或转码参数已变（缓存 key 变化）：旧任务作废，重新排队"
             );
-            self.jobs.remove(&source);
+            if let Some(old) = self.jobs.remove(&source) {
+                old.cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
             self.queue.retain(|item| item != &source);
+            if self.running.as_ref() == Some(&source) {
+                self.kill_running();
+                self.running = None;
+            }
         }
 
         if let Some(job) = self.jobs.get(&source) {
@@ -692,6 +725,7 @@ impl Transcoder {
                         message: Some("缓存已存在，直接复用（未重新转码）".to_string()),
                         spec,
                         started_at: None,
+                        cancel: Arc::new(AtomicBool::new(false)),
                     },
                 );
                 return JobView {
@@ -715,6 +749,7 @@ impl Transcoder {
                 message: None,
                 spec,
                 started_at: None,
+                cancel: Arc::new(AtomicBool::new(false)),
             },
         );
         self.queue.push_back(source.clone());
@@ -749,20 +784,31 @@ impl Transcoder {
             return;
         };
         let spec = job.spec.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        job.cancel = Arc::clone(&cancel);
         job.state = PrepareState::Running;
         job.progress_permille = 0;
         job.started_at = Some(Instant::now());
         let Some(program) = self.program.clone() else {
+            job.state = PrepareState::Failed;
+            job.started_at = None;
             return;
         };
         let profile = spec.profile.clone();
         let tx = self.tx.clone();
         let child_pid = Arc::clone(&self.child_pid);
         self.running = Some(source.clone());
-        std::thread::Builder::new()
+        if let Err(err) = std::thread::Builder::new()
             .name("liuguang-transcode".to_string())
-            .spawn(move || worker(program, profile, spec, tx, child_pid))
-            .ok();
+            .spawn(move || worker(program, profile, spec, tx, child_pid, cancel))
+        {
+            self.running = None;
+            if let Some(job) = self.jobs.get_mut(&source) {
+                job.state = PrepareState::Failed;
+                job.started_at = None;
+                job.message = Some(format!("启动转码线程失败: {err}"));
+            }
+        }
     }
 
     /// 把后台线程的消息收进状态机，返回需要对外广播的事件。
@@ -785,7 +831,17 @@ impl Transcoder {
                     cache_path,
                     stderr_tail,
                 } => {
-                    self.running = None;
+                    if self.running.as_ref() == Some(&source) {
+                        self.running = None;
+                    }
+                    let is_current = self
+                        .jobs
+                        .get(&source)
+                        .is_some_and(|job| !job.cancel.load(std::sync::atomic::Ordering::Acquire));
+                    if !is_current {
+                        tracing::debug!(source = %source.display(), "忽略已作废转码任务的完成消息");
+                        continue;
+                    }
                     if let Some(job) = self.jobs.get_mut(&source) {
                         job.state = PrepareState::Ready;
                         job.progress_permille = 1000;
@@ -800,12 +856,17 @@ impl Transcoder {
                     events.push(TranscodeEvent::Finished { source, cache_path });
                 }
                 WorkerMsg::Failed { source, message } => {
-                    self.running = None;
+                    if self.running.as_ref() == Some(&source) {
+                        self.running = None;
+                    }
                     let already_failed = self
                         .jobs
                         .get(&source)
-                        .map(|job| job.state == PrepareState::Failed)
-                        .unwrap_or(false);
+                        .map(|job| {
+                            job.state == PrepareState::Failed
+                                || job.cancel.load(std::sync::atomic::Ordering::Acquire)
+                        })
+                        .unwrap_or(true);
                     if let Some(job) = self.jobs.get_mut(&source) {
                         job.state = PrepareState::Failed;
                         job.message = Some(message.clone());
@@ -843,6 +904,7 @@ impl Transcoder {
                     JOB_TIMEOUT.as_secs() / 60
                 );
                 if let Some(job) = self.jobs.get_mut(&running) {
+                    job.cancel.store(true, std::sync::atomic::Ordering::Release);
                     job.state = PrepareState::Failed;
                     job.message = Some(message.clone());
                     job.started_at = None;
@@ -876,6 +938,11 @@ impl Transcoder {
     /// （t21 F6 的现场）。这里同步发 SIGTERM，800ms 后补 SIGKILL（见
     /// [`terminate_process_group`]）。
     pub fn shutdown(&mut self) {
+        if let Some(source) = &self.running {
+            if let Some(job) = self.jobs.get(source) {
+                job.cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         let spec = self
             .running
             .as_ref()
@@ -948,6 +1015,7 @@ fn worker(
     spec: JobSpec,
     tx: Sender<WorkerMsg>,
     child_pid: Arc<Mutex<Option<u32>>>,
+    cancel: Arc<AtomicBool>,
 ) {
     let mut last_error = String::new();
     let mut encoders = vec![profile.encoder.clone()];
@@ -955,8 +1023,15 @@ fn worker(
         encoders.push(profile.fallback_encoder.clone());
     }
     for encoder in encoders {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
         match run_ffmpeg(&program, &profile, &spec, &encoder, &tx, &child_pid) {
             Ok(stderr_tail) => {
+                if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    let _ = std::fs::remove_file(spec.part_path());
+                    break;
+                }
                 if rename_part(&spec).is_ok() {
                     let _ = tx.send(WorkerMsg::Done {
                         source: spec.source.clone(),
@@ -1760,6 +1835,7 @@ mod tests {
             job,
             tx,
             Arc::new(Mutex::new(None)),
+            Arc::new(AtomicBool::new(false)),
         );
         match rx.recv().unwrap() {
             WorkerMsg::Failed { message, .. } => {

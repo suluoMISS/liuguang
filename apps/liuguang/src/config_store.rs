@@ -75,7 +75,16 @@ pub fn persist(
     if prefs.is_empty() {
         return Ok(());
     }
-    let text = std::fs::read_to_string(path).map_err(ConfigStoreError::Read)?;
+    let text = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            String::new()
+        }
+        Err(err) => return Err(ConfigStoreError::Read(err)),
+    };
     let mut doc = text
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| ConfigStoreError::Parse(e.to_string()))?;
@@ -428,12 +437,17 @@ remember = "别删我"
     }
 
     #[test]
-    fn missing_file_reports_read_error() {
+    fn missing_file_bootstraps_and_directory_reports_read_error() {
         let dir = temp_dir("missing");
         let path = dir.join("nope.toml");
         let mut prefs = BTreeSet::new();
         prefs.insert(Preference::Transitions);
-        let err = persist(&path, &Config::default(), &prefs).unwrap_err();
+        persist(&path, &Config::default(), &prefs).unwrap();
+        assert!(path.exists(), "缺失文件应自动按空配置初始化并落盘");
+
+        let dir_as_cfg = dir.join("is_dir.toml");
+        std::fs::create_dir_all(&dir_as_cfg).unwrap();
+        let err = persist(&dir_as_cfg, &Config::default(), &prefs).unwrap_err();
         assert!(matches!(err, ConfigStoreError::Read(_)), "{err:?}");
     }
 

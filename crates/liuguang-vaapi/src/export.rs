@@ -176,10 +176,28 @@ pub fn export_surface(
     }
     let object_count = descriptor.num_objects as usize;
     let layer_count = descriptor.num_layers as usize;
+    let clamped_objects = object_count.min(ffi::VA_MAX_DRM_OBJECTS);
+    let mut objects = Vec::with_capacity(clamped_objects);
+    let mut negative_fd = false;
+    for object in descriptor.objects.iter().take(clamped_objects) {
+        if object.fd < 0 {
+            negative_fd = true;
+            continue;
+        }
+        // SAFETY: libva 把 fd 的所有权交给调用方（本项目负责关闭）；先全部接管再校验，防泄漏。
+        let owned = unsafe { OwnedFd::from_raw_fd(object.fd) };
+        objects.push((owned, object.drm_format_modifier));
+    }
     if object_count == 0 || object_count > ffi::VA_MAX_DRM_OBJECTS {
         return Err(VaapiError::Export {
             surface,
             message: format!("描述符里 num_objects={object_count} 非法"),
+        });
+    }
+    if negative_fd {
+        return Err(VaapiError::Export {
+            surface,
+            message: "描述符里有负的 dma-buf fd".into(),
         });
     }
     if layer_count == 0 || layer_count > ffi::VA_MAX_LAYERS {
@@ -188,38 +206,26 @@ pub fn export_surface(
             message: format!("描述符里 num_layers={layer_count} 非法"),
         });
     }
-    let mut objects = Vec::with_capacity(object_count);
-    for object in descriptor.objects.iter().take(object_count) {
-        if object.fd < 0 {
-            return Err(VaapiError::Export {
-                surface,
-                message: "描述符里有负的 dma-buf fd".into(),
-            });
-        }
-        // SAFETY: libva 把 fd 的所有权交给调用方（本项目负责关闭）。
-        let owned = unsafe { OwnedFd::from_raw_fd(object.fd) };
-        objects.push((owned, object.drm_format_modifier));
-    }
     let mut planes = Vec::with_capacity(layer_count);
     for layer in descriptor.layers.iter().take(layer_count) {
-        if layer.num_planes == 0 {
-            continue;
-        }
-        let object = layer.object_index[0] as usize;
-        if object >= object_count {
-            // 描述符自相矛盾：立刻关闭已取的 fd，避免泄漏。
-            return Err(VaapiError::Export {
-                surface,
-                message: format!(
-                    "layer 的 object_index={object} 越界（num_objects={object_count}）"
-                ),
+        let plane_count = (layer.num_planes as usize).min(4);
+        for plane_idx in 0..plane_count {
+            let object = layer.object_index[plane_idx] as usize;
+            if object >= object_count {
+                // objects 已由 OwnedFd 托管，提前返回会自动关闭所有 fd。
+                return Err(VaapiError::Export {
+                    surface,
+                    message: format!(
+                        "layer 的 object_index[{plane_idx}]={object} 越界（num_objects={object_count}）"
+                    ),
+                });
+            }
+            planes.push(ExportedPlane {
+                object,
+                offset: layer.offset[plane_idx],
+                pitch: layer.pitch[plane_idx],
             });
         }
-        planes.push(ExportedPlane {
-            object,
-            offset: layer.offset[0],
-            pitch: layer.pitch[0],
-        });
     }
     let modifier = objects.first().map_or(0, |(_, modifier)| *modifier);
     let exported = ExportedSurface {

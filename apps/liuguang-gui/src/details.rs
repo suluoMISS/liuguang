@@ -599,10 +599,9 @@ pub fn selected_output(view: &DetailsView) -> Option<String> {
     view.output_ids.borrow().get(index).cloned().flatten()
 }
 
-/// 刷新输出下拉框（保持原选择）。
+/// 刷新输出下拉框（列表未变化时不重建模型；保持原选择且不误触发实时联动）。
 pub fn sync_outputs(app: &Rc<App>, view: &Rc<DetailsView>) {
     let outputs = app.state.borrow().outputs.clone();
-    let current = selected_output(view);
     let mut entries = vec![String::from("全部输出")];
     let mut ids: Vec<Option<String>> = vec![None];
     for output in &outputs {
@@ -612,9 +611,14 @@ pub fn sync_outputs(app: &Rc<App>, view: &Rc<DetailsView>) {
         entries.push(output.name.clone());
         ids.push(Some(output.name.clone()));
     }
+    if *view.output_ids.borrow() == ids {
+        return;
+    }
+    let current = selected_output(view);
+    let prev = view.live_syncing.replace(true);
     let strings: Vec<&str> = entries.iter().map(String::as_str).collect();
-    view.output.set_model(Some(&gtk::StringList::new(&strings)));
     *view.output_ids.borrow_mut() = ids;
+    view.output.set_model(Some(&gtk::StringList::new(&strings)));
     if let Some(current) = current {
         if let Some(index) = view
             .output_ids
@@ -625,6 +629,7 @@ pub fn sync_outputs(app: &Rc<App>, view: &Rc<DetailsView>) {
             view.output.set_selected(u32::try_from(index).unwrap_or(0));
         }
     }
+    view.live_syncing.set(prev);
 }
 
 /// `Rotation`（0/90/180/270 度）→ 协议里的角度值。

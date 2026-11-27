@@ -63,6 +63,8 @@ pub struct SettingsView {
     pub dirty: Cell<bool>,
     /// 正在用配置回填控件（不要把回填当用户改动）。
     pub syncing: Cell<bool>,
+    /// 后台 systemd 用户服务操作执行中（阻止周期刷新抢先重启用按钮）。
+    pub service_busy: Cell<bool>,
 }
 
 const RGB_IDS: [&str; 3] = ["auto", "always", "never"];
@@ -305,6 +307,7 @@ pub fn build(app: &Rc<App>) -> Rc<SettingsView> {
         status,
         dirty: Cell::new(false),
         syncing: Cell::new(false),
+        service_busy: Cell::new(false),
     });
 
     // —— 控件变化 → 标脏 ——
@@ -426,7 +429,9 @@ pub fn build(app: &Rc<App>) -> Rc<SettingsView> {
                 app.toast("媒体目录必须是绝对路径");
                 return;
             }
-            let kind = SOURCE_KINDS[view.source_kind.selected() as usize]
+            let kind = SOURCE_KINDS
+                .get(view.source_kind.selected() as usize)
+                .unwrap_or(&SOURCE_KINDS[0])
                 .0
                 .to_owned();
             app.send(Cmd::AddSource {
@@ -466,8 +471,6 @@ pub fn build(app: &Rc<App>) -> Rc<SettingsView> {
         view.reload.connect_clicked(move |_| {
             if let (Some(app), Some(view)) = (app.upgrade(), view_down.upgrade()) {
                 app.send(Cmd::Reload);
-                app.send(Cmd::Config);
-                app.send(Cmd::Sources);
                 view.dirty.set(false);
                 view.apply.set_sensitive(false);
                 view.status.set_text("已请求重新读取配置");
@@ -556,6 +559,7 @@ pub fn refresh(app: &Rc<App>, view: &Rc<SettingsView>) {
 }
 
 fn set_service_controls_busy(view: &SettingsView, busy: bool) {
+    view.service_busy.set(busy);
     if busy {
         view.service_start.set_sensitive(false);
         view.service_restart.set_sensitive(false);
@@ -566,6 +570,7 @@ fn set_service_controls_busy(view: &SettingsView, busy: bool) {
 }
 
 fn apply_service_status(app: &App, view: &SettingsView, status: &ServiceStatus) {
+    view.service_busy.set(false);
     let subtitle = if !status.unit_found {
         "未检测到用户单元（需先安装 liuguang.service 到用户 systemd 目录）"
     } else if status.active {
@@ -602,7 +607,7 @@ fn apply_service_status(app: &App, view: &SettingsView, status: &ServiceStatus) 
 
 /// 异步刷新桌面模式用户服务与配置文件状态。
 pub fn refresh_service(app: &Rc<App>, view: &Rc<SettingsView>) {
-    if app.persona != Persona::User {
+    if app.persona != Persona::User || view.service_busy.get() {
         return;
     }
     let config_path = app.config_path.clone();
@@ -666,6 +671,7 @@ fn run_service_action(app: &Rc<App>, view: &Rc<SettingsView>, action: ServiceAct
                 }
             }
             Err(error) => {
+                set_service_controls_busy(&view, false);
                 view.status.set_text(&format!("服务操作失败：{error}"));
                 app.notify_error("service", &error);
                 refresh_service(&app, &view);
@@ -838,8 +844,6 @@ pub fn save(app: &Rc<App>, view: &Rc<SettingsView>) {
                 app.config_path.display()
             ));
             app.send(Cmd::Reload);
-            app.send(Cmd::Config);
-            app.send(Cmd::Sources);
             app.toast("设置已保存，守护进程正在重载");
         }
         Err(error) => {

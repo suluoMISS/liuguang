@@ -170,10 +170,13 @@ pub fn run_action(
     action: ServiceAction,
     config_path: &Path,
 ) -> Result<(String, ServiceStatus), String> {
-    let media_dir = ensure_user_setup(config_path)?;
     let msg = match action {
-        ServiceAction::InitConfig => format!("桌面配置与壁纸目录已就绪（{}）", media_dir.display()),
+        ServiceAction::InitConfig => {
+            let media_dir = ensure_user_setup(config_path)?;
+            format!("桌面配置与壁纸目录已就绪（{}）", media_dir.display())
+        }
         ServiceAction::Start => {
+            ensure_user_setup(config_path)?;
             run_systemctl_checked(&["--user", "start", USER_UNIT])?;
             "已启动后台壁纸服务".to_owned()
         }
@@ -182,10 +185,12 @@ pub fn run_action(
             "已停止后台壁纸服务".to_owned()
         }
         ServiceAction::Restart => {
+            ensure_user_setup(config_path)?;
             run_systemctl_checked(&["--user", "restart", USER_UNIT])?;
             "已重启后台壁纸服务".to_owned()
         }
         ServiceAction::EnableAndStart => {
+            ensure_user_setup(config_path)?;
             run_systemctl_checked(&["--user", "enable", "--now", USER_UNIT])?;
             "已启动后台壁纸服务并设为登录自启".to_owned()
         }

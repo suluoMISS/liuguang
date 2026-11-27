@@ -198,6 +198,8 @@ pub enum Upd {
         id: String,
         compat: Option<CompatInfo>,
     },
+    /// 兼容性查询失败（清理 `compat_pending`）。
+    CompatFailed(String),
     /// 转码准备状态（`prepare_media` 回包，幂等查询也走这里）。
     Prepared {
         path: String,
@@ -218,6 +220,11 @@ pub enum Upd {
         id: String,
         at_ms: u64,
         png_b64: String,
+    },
+    /// 缩略图请求失败（清理 `pending`）。
+    ThumbFailed {
+        id: String,
+        at_ms: u64,
     },
     /// 一句人话（失败），GUI 以红色 toast + 状态栏显示。
     Error(String),
@@ -300,24 +307,44 @@ pub fn spawn(
     (tx_cmd, tx_urgent, rx_upd)
 }
 
-/// 事件订阅循环：断线（daemon 重启）后退避 1s 重连。
+/// 事件订阅循环：断线（daemon 重启）后退避 1s 重连；GUI 接收端关闭后退出。
 fn events_loop(socket: &Path, tx: async_channel::Sender<Upd>) {
-    loop {
-        if let Err(error) = subscribe_once(socket, &tx) {
-            // 订阅偶尔失败不值得红色 toast；它不影响命令通道，
-            // 而且 daemon 重启后 1s 内就会自动恢复。
-            let _ = tx.send_blocking(Upd::Notice(format!("事件订阅断开，正在重连：{error}")));
+    let mut disconnected_notified = false;
+    while !tx.is_closed() {
+        match subscribe_once(socket, &tx, &mut disconnected_notified) {
+            Ok(()) => disconnected_notified = false,
+            Err(error) => {
+                if tx.is_closed() {
+                    break;
+                }
+                if !disconnected_notified {
+                    // 订阅偶尔失败不值得红色 toast；断线期间只提醒一次，
+                    // daemon 重启后 1s 内就会自动恢复。
+                    if tx
+                        .send_blocking(Upd::Notice(format!("事件订阅断开，正在重连：{error}")))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    disconnected_notified = true;
+                }
+            }
         }
         thread::sleep(Duration::from_millis(1000));
     }
 }
 
 /// 一次订阅会话：连接 → 写 `SUBSCRIBE` → 先读确认帧 → 逐行读事件。
-fn subscribe_once(socket: &Path, tx: &async_channel::Sender<Upd>) -> Result<(), String> {
+fn subscribe_once(
+    socket: &Path,
+    tx: &async_channel::Sender<Upd>,
+    disconnected_notified: &mut bool,
+) -> Result<(), String> {
     use std::io::{BufRead, BufReader, Write};
 
     let mut stream = std::os::unix::net::UnixStream::connect(socket)
         .map_err(|e| format!("连不上 {}：{e}", socket.display()))?;
+    *disconnected_notified = false;
     let request = Request::new("gui-events", Method::Subscribe, json!({}));
     let line = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
     stream.write_all(&line).map_err(|e| e.to_string())?;
@@ -356,12 +383,23 @@ enum IpcErr {
 fn ipc_loop(socket: &Path, config_path: &Path, rx: Receiver<Cmd>, tx: async_channel::Sender<Upd>) {
     let mut client: Option<IpcClient> = None;
     while let Ok(cmd) = rx.recv() {
+        let failure_upd = match &cmd {
+            Cmd::MediaCompat { id } => Some(Upd::CompatFailed(id.clone())),
+            Cmd::Thumbnail { id, at_ms, .. } => Some(Upd::ThumbFailed {
+                id: id.clone(),
+                at_ms: *at_ms,
+            }),
+            _ => None,
+        };
         // 每次命令前确保连接可用；断了就重连（守护进程重启是常态：
         // 用户改完配置执行 `systemctl --user restart liuguang`）。
         if client.is_none() {
             match IpcClient::connect(socket) {
                 Ok(c) => client = Some(c),
                 Err(e) => {
+                    if let Some(upd) = failure_upd {
+                        let _ = tx.send_blocking(upd);
+                    }
                     let _ = tx.send_blocking(Upd::Error(format!(
                         "连不上 liuguang（{}）：{e}",
                         socket.display()
@@ -378,11 +416,18 @@ fn ipc_loop(socket: &Path, config_path: &Path, rx: Receiver<Cmd>, tx: async_chan
                 let _ = tx.send_blocking(upd);
             }
             Err(IpcErr::Business(message)) => {
-                let _ = tx.send_blocking(Upd::Error(message));
+                if let Some(upd) = failure_upd {
+                    let _ = tx.send_blocking(upd);
+                } else {
+                    let _ = tx.send_blocking(Upd::Error(message));
+                }
             }
             Err(IpcErr::Transport(message)) => {
                 // 传输层错误 ⇒ 连接已不可信，丢掉等下次重连。
                 client = None;
+                if let Some(upd) = failure_upd {
+                    let _ = tx.send_blocking(upd);
+                }
                 let _ = tx.send_blocking(Upd::Error(message));
                 thread::sleep(Duration::from_millis(200));
             }

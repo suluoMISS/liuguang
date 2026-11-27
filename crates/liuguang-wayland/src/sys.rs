@@ -102,5 +102,5 @@ pub(crate) fn poll_readable(fd: RawFd, timeout_ms: i32) -> bool {
     };
     // SAFETY: `pfd` 是本栈上有效的单个 `pollfd`。
     let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-    rc > 0 && (pfd.revents & libc::POLLIN) != 0
+    rc > 0 && (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0
 }

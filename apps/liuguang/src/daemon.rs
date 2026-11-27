@@ -248,15 +248,19 @@ enum ProducerKind {
 /// 遗留 `LIUGUANG_VIDEO_DMABUF=1` 的旧 unit 若仍按直通协商开管线，每一帧都会被
 /// 显示侧拒绝 ⇒ 视频从"能播"回归成"播不了"。
 ///
-/// 优先级保持与历史一致：已闩死/后端不支持 ⇒ CPU；否则旋转 ⇒ RGBA；否则 Auto。
+/// 优先级保持与历史一致：需要像素级变换（旋转/亮度）⇒ RGBA；已闩死/后端不支持 ⇒ CPU；否则 Auto。
 #[cfg(feature = "gstreamer")]
-fn producer_kind(force_cpu: bool, backend_dmabuf: bool, rotation: Rotation) -> ProducerKind {
-    if force_cpu || !backend_dmabuf {
-        ProducerKind::Cpu
-    } else if rotation == Rotation::Deg0 {
-        ProducerKind::Auto
-    } else {
+fn producer_kind(
+    force_cpu: bool,
+    backend_dmabuf: bool,
+    needs_pixel_transform: bool,
+) -> ProducerKind {
+    if needs_pixel_transform {
         ProducerKind::Rgba
+    } else if force_cpu || !backend_dmabuf {
+        ProducerKind::Cpu
+    } else {
+        ProducerKind::Auto
     }
 }
 
@@ -391,6 +395,23 @@ impl TransitionSettings {
                 direction: direction.unwrap_or(TransitionDirection::Left),
             },
             "circle" => EffectKind::Circle,
+            "random" => {
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.subsec_nanos());
+                let dir = match seed % 4 {
+                    0 => TransitionDirection::Left,
+                    1 => TransitionDirection::Right,
+                    2 => TransitionDirection::Up,
+                    _ => TransitionDirection::Down,
+                };
+                match (seed / 4) % 4 {
+                    0 => EffectKind::Fade,
+                    1 => EffectKind::Slide { direction: dir },
+                    2 => EffectKind::Wipe { direction: dir },
+                    _ => EffectKind::Circle,
+                }
+            }
             _ => EffectKind::Fade,
         };
         TransitionSpec {
@@ -662,6 +683,7 @@ struct PendingSet {
     /// 客户端传进来的原始路径（事件里回显它，而不是转码缓存路径）。
     declared_path: String,
     pin: bool,
+    transform_changed: bool,
 }
 
 /// 待发出的 `WALLPAPER_APPLIED` 事件（在 `tick()` 里发，保证"受理响应先于完成事件"）。
@@ -858,14 +880,8 @@ pub struct Runtime {
     test_fullscreen_applied: bool,
     /// 长间隔钩子是否已经用掉（同上，一次性）。
     test_gap_applied: bool,
-    /// VA-API 首帧校验是否已经通过（t43）。
-    ///
-    /// 校验（拿一帧、看后端收不收这个修饰符）本身约 500ms：解码器起泵 + 预读线程首帧。
-    /// 它只在**第一次**打开 VA-API 管线时必要——同一后端、同一节点集合下结论不会变。
-    /// 通过一次之后就跳过同步校验、直接建好管线返回，把首帧留给渲染循环：
-    /// `set_wallpaper` 的延迟因此从 ~700ms 降到 ~430ms。
-    /// 画面被后端拒收而降级时清掉标志，让下一次重新校验。
-    vaapi_first_frame_verified: bool,
+    /// VA-API 首帧校验已通过的 `(节点路径, 是否RGB转换)`（t43）。
+    vaapi_verified_node: Option<(PathBuf, bool)>,
     /// 媒体索引（异步扫描产物）。
     media: MediaIndex,
     /// 本机解码能力（t15：兼容性分类的输入；构造期探测一次）。
@@ -940,6 +956,8 @@ pub struct Runtime {
     fullscreen_polled: Option<Instant>,
     /// 兜底探测（niri IPC）的下次允许时刻：合成器不发"退出全屏"事件时靠它确认。
     fullscreen_verify_due: Option<Instant>,
+    /// 已通过兜底探测确认退出全屏的窗口签名（避免合成器残留状态标志引发 2 秒启停振荡）。
+    fullscreen_suppressed: Option<String>,
     /// 图片预加载缓存（`performance.preload_next` 决定用不用、
     /// `performance.max_cache_mb` 决定字节预算）。
     preload: liuguang_media::prepared::PreloadCache,
@@ -1006,29 +1024,7 @@ impl Runtime {
             }
         };
         let persona = Persona::System;
-        let transitions = TransitionSettings {
-            effect: match config.transition.effect {
-                liuguang_core::config::TransitionEffect::Fade => "fade".into(),
-                liuguang_core::config::TransitionEffect::Slide => "slide".into(),
-                liuguang_core::config::TransitionEffect::Wipe => "wipe".into(),
-                liuguang_core::config::TransitionEffect::Circle => "circle".into(),
-                liuguang_core::config::TransitionEffect::Random => "random".into(),
-                liuguang_core::config::TransitionEffect::None => "none".into(),
-            },
-            duration_ms: config.transition.duration_ms,
-            easing: match config.transition.easing {
-                liuguang_core::config::Easing::Linear => "linear".into(),
-                liuguang_core::config::Easing::EaseIn => "ease-in".into(),
-                liuguang_core::config::Easing::EaseOut => "ease-out".into(),
-                liuguang_core::config::Easing::EaseInOut => "ease-in-out".into(),
-            },
-            direction: config.transition.direction.map(|d| match d {
-                liuguang_core::config::TransitionDirection::Left => "left".into(),
-                liuguang_core::config::TransitionDirection::Right => "right".into(),
-                liuguang_core::config::TransitionDirection::Up => "up".into(),
-                liuguang_core::config::TransitionDirection::Down => "down".into(),
-            }),
-        };
+        let transitions = transition_settings_from_config(&config.transition);
         // **T62**：播放列表随配置持久化 —— 启动时装载（条目过 media.resolve() 边界）。
         // `loaded=false` 表示"文件里有、但这次没有安全边界可比对（缺 [library]）"：
         // 此时保存必须**原样保留**文件里的播放列表，绝不能写空（数据丢失）。
@@ -1078,7 +1074,7 @@ impl Runtime {
             test_fullscreen_until: None,
             test_fullscreen_applied: false,
             test_gap_applied: false,
-            vaapi_first_frame_verified: false,
+            vaapi_verified_node: None,
             media: MediaIndex::default(),
             caps,
             transcode,
@@ -1115,6 +1111,7 @@ impl Runtime {
             fullscreen_info: None,
             fullscreen_polled: None,
             fullscreen_verify_due: None,
+            fullscreen_suppressed: None,
             preload,
             // 首次显示静态图时会被 `show_image` 按真实输出模式覆盖。
             preload_dims: (2560, 1600),
@@ -1426,10 +1423,10 @@ impl Runtime {
     /// `output` 为 `None`（适用于所有输出）或等于该通道名的条目。
     /// 多屏时想让两台屏播不同列表，就给每条列表写 `output`。
     fn active_playlist(&self, key: &str) -> Option<&liuguang_ipc::protocol::Playlist> {
-        self.playlists.iter().find(|p| match p.output.as_deref() {
-            None => true,
-            Some(o) => o == key,
-        })
+        self.playlists
+            .iter()
+            .find(|p| p.output.as_deref() == Some(key))
+            .or_else(|| self.playlists.iter().find(|p| p.output.is_none()))
     }
 
     /// 该通道**应当**使用的播放源（标签 + 顺序模式 + 播放模式），不改动通道状态。
@@ -2332,6 +2329,13 @@ impl Runtime {
                     if self.channels.contains_key(&key) {
                         tracing::warn!(output = %key, "显示器断开");
                         self.channels.remove(&key);
+                        self.user_paused.remove(&key);
+                        self.fullscreen_paused.remove(&key);
+                        self.screen_paused.remove(&key);
+                        self.game_paused.remove(&key);
+                        self.gpu_paused.remove(&key);
+                        self.battery_paused.remove(&key);
+                        self.pending_sets.retain(|p| p.output != key);
                         self.events.publish(
                             EventMessage::new(EventKind::OutputChanged)
                                 .with_output(key)
@@ -2346,6 +2350,8 @@ impl Runtime {
                             self.preload.clear();
                             self.preload_stamps.clear();
                             self.drive(Event::OutputLost);
+                        } else {
+                            self.sync_top_level_pause_state();
                         }
                     }
                 }
@@ -2455,13 +2461,22 @@ impl Runtime {
         let gpu_above = self.config.performance.pause_when_gpu_memory_above;
         let gpu_below = self.config.performance.resume_when_gpu_memory_below;
         let gpu_disabled = gpu_above == 0 || gpu_above <= gpu_below;
-        if self
+        match self
             .gpu
             .reconfigure(f32::from(gpu_above), f32::from(gpu_below))
-            == crate::gpu_pressure::Action::Resume
-            || (gpu_disabled && !self.gpu_paused.is_empty())
         {
-            let _ = self.resume_channels_for_reason(PauseReason::GpuMemory, now);
+            crate::gpu_pressure::Action::Resume => {
+                let _ = self.resume_channels_for_reason(PauseReason::GpuMemory, now);
+            }
+            crate::gpu_pressure::Action::Pause => {
+                let _ = self.pause_channels_for_reason(PauseReason::GpuMemory);
+            }
+            crate::gpu_pressure::Action::Unchanged
+                if gpu_disabled && !self.gpu_paused.is_empty() =>
+            {
+                let _ = self.resume_channels_for_reason(PauseReason::GpuMemory, now);
+            }
+            crate::gpu_pressure::Action::Unchanged => {}
         }
         if self.game.reconfigure(
             self.config.performance.detect_games,
@@ -2654,6 +2669,7 @@ impl Runtime {
         if let Some(frame) = done_frame {
             if let Some(ch) = self.channels.get_mut(key) {
                 ch.transition = None;
+                ch.pending_target = None;
             }
             let logged = DisplayFrame::Cpu(frame.clone());
             let res = self.present_frame(key, frame);
@@ -3255,6 +3271,9 @@ impl Runtime {
         let interval = self.effective_interval(key);
         if let Some(ch) = self.channels.get_mut(key) {
             ch.video = None;
+            if !started_transition {
+                ch.pending_target = None;
+            }
             // T68：换项即重置"视频播完一轮"的观察状态（否则新视频的首个 PTS
             // 会被拿旧视频的 PTS 去比，误判成回卷）；成功切换也清掉轮换错误历史。
             ch.last_video_pts = None;
@@ -3327,12 +3346,17 @@ impl Runtime {
             // VA-API 零拷贝直通优先于 GStreamer：解码器把表面导出成
             // DMA-BUF 直接交给合成器，CPU 只做一次导入（0 拷贝）。
             // 不可用（无节点/跨 GPU 修饰符不被接受）时静默回落到 GStreamer。
+            let rt = self.output_render_transform(key);
             #[cfg(feature = "vaapi")]
             // 能力性拒绝（10bit / 没有可用 VA-API 解码器）由 `?` **立即返回**：
             // 不许静默软解 —— 用户要看到"该素材解不了，怎么解决"。
-            let vaapi = self.open_vaapi_producer(key, path.as_path())?;
+            let vaapi = if force_cpu {
+                None
+            } else {
+                self.open_vaapi_producer(key, path.as_path())?
+            };
             #[cfg(feature = "vaapi")]
-            if let Some(producer) = vaapi {
+            if let Some((producer, node, needs_rgb)) = vaapi {
                 use liuguang_media::video::FrameProducer as _;
                 // 走 GPU 转换时交出去的是 XRGB8888（合成器能正确染色），
                 // 标签里如实写出来，`liuguangctl status` 一眼能看出走了哪条路。
@@ -3344,8 +3368,8 @@ impl Runtime {
                 let attached =
                     self.attach_video_player(key, path.as_path(), producer, "nvdec", capture_mode);
                 if attached.is_ok() {
-                    // 这个后端已经收过 VA-API 的帧：后续 set 不必再同步等首帧（t43）。
-                    self.vaapi_first_frame_verified = true;
+                    // 这个后端已经收过 VA-API 的帧：后续同节点+同模式 set 不必再同步等首帧（t43）。
+                    self.vaapi_verified_node = Some((node, needs_rgb));
                 }
                 return attached;
             }
@@ -3360,7 +3384,14 @@ impl Runtime {
                 path,
                 crate::compat::DecodeConsumer::GStreamer,
             )?;
-            let producer = match producer_kind(force_cpu, self.backend.supports_dmabuf_scanout(), rotation) {                ProducerKind::Cpu => {
+            let needs_pixel_transform =
+                rotation != Rotation::Deg0 || (rt.brightness - 1.0).abs() > 1e-4;
+            let producer = match producer_kind(
+                force_cpu,
+                self.backend.supports_dmabuf_scanout(),
+                needs_pixel_transform,
+            ) {
+                ProducerKind::Cpu => {
                     // 直通被拒（已闩死）**或后端本就不扫描输出 DMA-BUF**：CPU 捕获模式。
                     // 生产者选择必须跟随后端的**实际能力**：旧 unit 遗留
                     // `LIUGUANG_VIDEO_DMABUF=1` 时若仍按直通协商开管线，每一帧都会被
@@ -3575,8 +3606,10 @@ impl Runtime {
         let game_active = self.game_paused.contains(key) || self.game.is_engaged();
         let gpu_active = self.gpu_paused.contains(key) || self.gpu.is_engaged();
         let battery_active = self.battery_paused.contains(key) || self.power.is_on_battery();
+        let user_active = self.user_paused.contains(key);
         let environment_paused =
             fs_active || screen_off || game_active || gpu_active || battery_active;
+        let should_pause = environment_paused || user_active;
         if fs_active {
             self.fullscreen_paused.insert(key.to_string());
         }
@@ -3592,7 +3625,7 @@ impl Runtime {
         if battery_active {
             self.battery_paused.insert(key.to_string());
         }
-        if environment_paused {
+        if should_pause {
             let _ = player.pause_at(Instant::now());
         }
         if let Some(ch) = self.channels.get_mut(key) {
@@ -3610,6 +3643,7 @@ impl Runtime {
             ch.video_loops = 0;
             ch.last_rotation_error = None;
             ch.transition = None;
+            ch.pending_target = None;
             ch.current = Some(CurrentDisplay {
                 media: path.to_path_buf(),
                 frame: CpuFrame {
@@ -3624,7 +3658,7 @@ impl Runtime {
             });
         }
         self.publish_media(key, path);
-        if environment_paused {
+        if should_pause {
             self.pause_video_supply(key);
         }
         // 顶层状态机：切换 → 准备完成 → 视频已开始。
@@ -3676,7 +3710,8 @@ impl Runtime {
         &self,
         key: &str,
         path: &Path,
-    ) -> Result<Option<liuguang_vaapi::VaapiProducer>, ErrorBody> {
+    ) -> Result<Option<(liuguang_vaapi::VaapiProducer, PathBuf, bool)>, ErrorBody> {
+        use liuguang_core::fit::FitMode;
         use liuguang_media::video::{FrameProducer as _, VideoPoll};
 
         let setting = std::env::var("LIUGUANG_VIDEO_VAAPI")
@@ -3703,8 +3738,12 @@ impl Runtime {
         // 所以不改提交方式：在 GPU 上把 NV12 转成单平面 XRGB8888 再交出去，颜色正确，
         // 而且依然零拷贝（输出是 gbm BO，不经 CPU 回读）。转换不可用时才回落 CPU 路径。
         let rt = self.output_render_transform(key);
-        let transform_needs_rgb =
-            rt.rotation != Rotation::Deg0 || (rt.brightness - 1.0).abs() > 1e-4;
+        let transform_needs_rgb = rt.rotation != Rotation::Deg0
+            || (rt.brightness - 1.0).abs() > 1e-4
+            || rt.fit != FitMode::Cover
+            || (rt.zoom - 1.0).abs() > 1e-4
+            || rt.offset_x.abs() > 1e-4
+            || rt.offset_y.abs() > 1e-4;
         let force_never_rgb = self
             .config
             .media
@@ -3725,7 +3764,13 @@ impl Runtime {
                  （NV12 → XRGB8888，仍为零拷贝）；若合成器已修好，可在 [media] video_dmabuf_rgb 写 \"never\""
             );
         }
-        let candidates: Vec<PathBuf> = if forced_node {
+        let preferred_mods = if needs_rgb {
+            self.backend
+                .dmabuf_modifiers_for(liuguang_vaapi::export::DRM_FORMAT_XRGB8888)
+        } else {
+            Vec::new()
+        };
+        let mut candidates: Vec<PathBuf> = if forced_node {
             vec![PathBuf::from(&setting)]
         } else {
             // `render_nodes()` 只按名字排序，会稳定地先试 `renderD128`——那可能是
@@ -3736,6 +3781,15 @@ impl Runtime {
                 .map(PathBuf::from)
                 .collect()
         };
+        if !forced_node
+            && let Some((verified_node, verified_rgb)) = self.vaapi_verified_node.as_ref()
+            && *verified_rgb == needs_rgb
+            && let Some(pos) = candidates.iter().position(|n| n == verified_node)
+            && pos > 0
+        {
+            let node = candidates.remove(pos);
+            candidates.insert(0, node);
+        }
         tracing::debug!(?candidates, "VA-API 候选渲染节点（显示 GPU 优先）");
         for node in candidates {
             if !liuguang_vaapi::probe_node(&node) {
@@ -3755,7 +3809,7 @@ impl Runtime {
                 continue;
             }
             let opened = if needs_rgb {
-                liuguang_vaapi::VaapiProducer::open_rgb(path, &node)
+                liuguang_vaapi::VaapiProducer::open_rgb_with_modifiers(path, &node, &preferred_mods)
             } else {
                 liuguang_vaapi::VaapiProducer::open(path, &node)
                     .map_err(liuguang_media::MediaError::from)
@@ -3791,14 +3845,12 @@ impl Runtime {
                 }
             };
             // 先解一帧出来，确认这个节点的修饰符当前后端收不收。
-            //
-            // 非阻塞生产者：`NeedMore` 只说明预读线程还在攒第一帧，不是节点不可用
-            // （见 `VAAPI_FIRST_FRAME_TIMEOUT`）。
-            // t43：首帧预算只用来"看一眼"节点是否可用，**不能**变成 set 的同步等待。
-            // 超过预算就先接受这条管线（渲染循环会继续拉帧），否则 4K60 的 set 会被
-            // 首帧解码 + 换节点重试拖到 700ms+（t41 F2 的现场）。
             let mut optimistic = false;
-            let first_frame = if self.vaapi_first_frame_verified {
+            let first_frame = if self
+                .vaapi_verified_node
+                .as_ref()
+                .is_some_and(|(n, r)| n == &node && *r == needs_rgb)
+            {
                 optimistic = true;
                 tracing::debug!(
                     node = %node.display(),
@@ -3858,7 +3910,7 @@ impl Runtime {
                     rgb = needs_rgb,
                     "VA-API 零拷贝直通已选中该渲染节点"
                 );
-                return Ok(Some(producer));
+                return Ok(Some((producer, node, needs_rgb)));
             }
             // 单个节点被否是**正常**的：跨 GPU 时本机必然有一个节点产出的修饰符
             // 合成器不认。逐节点记 debug，全部失败时在函数末尾统一告警一次。
@@ -4095,6 +4147,7 @@ impl Runtime {
         reason: &str,
         video_next: Option<Instant>,
     ) -> Option<Instant> {
+        let was_cached = self.vaapi_verified_node.take().is_some();
         let (count, first) = match self.channels.get_mut(key) {
             Some(ch) => {
                 ch.dmabuf_rejections = ch.dmabuf_rejections.saturating_add(1);
@@ -4113,6 +4166,7 @@ impl Runtime {
                 output = %key,
                 reason,
                 rejections = count,
+                was_cached,
                 "显示侧**拒绝 DMA-BUF 直通**：已闩死该通道的零拷贝路径，\
                  重开 CPU 生产者继续播放（视频不会降级成静态图）"
             );
@@ -4141,6 +4195,7 @@ impl Runtime {
             tracing::warn!(output = %key, "DMA-BUF 被拒但通道没有当前媒体路径，无法重开");
             return Some(video_next.unwrap_or_else(|| Instant::now() + VIDEO_DMABUF_LATCH_REPOLL));
         };
+        // force_cpu = true：直接跳过 VA-API，避免先试 VA-API 再重复被拒陷入无限重开循环。
         match self.show_video_with(key, &path, true) {
             Ok(()) => {
                 tracing::info!(
@@ -4175,7 +4230,7 @@ impl Runtime {
         // t43：真实帧都没能提交成功，说明"这个后端 + 这个节点集合能出被接受的帧"
         // 的结论已经不成立（换显示器/换 GPU/驱动升级都可能）——清掉标志，
         // 下一次开视频重新做一次同步首帧校验，别带着错误的乐观假设继续跑。
-        self.vaapi_first_frame_verified = false;
+        self.vaapi_verified_node = None;
         // 若这次失败发生在"master **未被确认**"期间，它很可能同样是环境问题：
         // 记下媒体路径，等 master 自愈后自动重建视频（否则屏幕永久停在静态帧）。
         //
@@ -4198,6 +4253,7 @@ impl Runtime {
         );
         if let Some(ch) = self.channels.get_mut(key) {
             ch.video = None;
+            ch.pending_target = None;
             ch.last_video_pts = None;
             ch.stall_reported = false;
             // 降级原因**如实存档**（审核 P2-6）：状态输出引用它，而不是从
@@ -4216,7 +4272,12 @@ impl Runtime {
         }
         self.drive(Event::ErrorOccurred);
         let recovered = self.try_fallback(key);
-        if recovered && self.state.current() == State::DegradedStatic {
+        if recovered
+            && matches!(
+                self.state.current(),
+                State::DegradedStatic | State::Recovering
+            )
+        {
             self.drive(Event::Recovered);
         } else if !recovered {
             tracing::warn!(
@@ -5249,6 +5310,7 @@ impl Runtime {
                 },
             );
         }
+        self.removed_sources.retain(|id| id != &source_id);
         self.added_sources
             .push((params.kind, resolved, params.recursive));
         ok_response(
@@ -5333,15 +5395,21 @@ impl Runtime {
     /// 判 playable 的 `.mkv`，开屏时被 GStreamer 的 `qtdemux` 拒绝
     /// （`atom has bogus size`），用户看到的是 `UNSUPPORTED_CODEC`。
     fn playback_consumer(&self, key: &str) -> crate::compat::DecodeConsumer {
-        let consumer = crate::compat::DecodeConsumer::for_playback(
-            cfg!(feature = "vaapi"),
-            self.vaapi_setting_enabled(),
-            self.backend.supports_dmabuf_scanout(),
-            self.caps.consumer,
-        );
+        let latched = self.channels.get(key).is_some_and(|ch| ch.dmabuf_latched);
+        let consumer = if latched {
+            crate::compat::DecodeConsumer::GStreamer
+        } else {
+            crate::compat::DecodeConsumer::for_playback(
+                cfg!(feature = "vaapi"),
+                self.vaapi_setting_enabled(),
+                self.backend.supports_dmabuf_scanout(),
+                self.caps.consumer,
+            )
+        };
         tracing::debug!(
             output = key,
             consumer = consumer.as_str(),
+            latched,
             "该输出实际使用的解码路径（判定与播放共用）"
         );
         consumer
@@ -5862,11 +5930,18 @@ impl Runtime {
                 );
             }
         }
+        let next_num = self
+            .playlists
+            .iter()
+            .filter_map(|p| p.id.strip_prefix("pl-")?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0)
+            + 1;
         let pl = liuguang_ipc::protocol::Playlist {
             id: params
                 .playlist_id
                 .clone()
-                .unwrap_or_else(|| format!("pl-{}", self.playlists.len() + 1)),
+                .unwrap_or_else(|| format!("pl-{next_num}")),
             name: params.name,
             entries: params
                 .entries
@@ -5881,9 +5956,20 @@ impl Runtime {
             output: params.output,
             no_repeat: params.no_repeat,
         };
-        match self.playlists.iter_mut().find(|p| p.id == pl.id) {
-            Some(slot) => *slot = pl.clone(),
-            None => self.playlists.push(pl.clone()),
+        let old_output = match self.playlists.iter_mut().find(|p| p.id == pl.id) {
+            Some(slot) => {
+                let prev = slot.output.clone();
+                *slot = pl.clone();
+                prev
+            }
+            None => {
+                self.playlists.push(pl.clone());
+                None
+            }
+        };
+        self.playlists_loaded = true;
+        if old_output != pl.output {
+            self.apply_playlist_change(old_output.as_deref());
         }
         // T68：列表内容变了 ⇒ 受影响通道的游标**立即**重建。否则就是
         // "update_playlist 返回成功，但还在播更新前的东西"（报告成功却没做）；
@@ -6010,32 +6096,46 @@ impl Runtime {
         if !has_pending_set {
             let rt = self.output_render_transform(&key);
             let live_updated = if let Some(ch) = self.channels.get_mut(&key) {
-                let is_nvdec_passthrough =
-                    ch.current.as_ref().is_some_and(|d| d.decoder == "nvdec")
-                        && ch
-                            .video
-                            .as_ref()
-                            .is_some_and(|v| !v.handles_render_transform());
-                let needs_rgb_upgrade = is_nvdec_passthrough
-                    && (rt.rotation != Rotation::Deg0 || (rt.brightness - 1.0).abs() > 1e-4)
-                    && !self
-                        .config
-                        .media
-                        .video_dmabuf_rgb
-                        .trim()
-                        .eq_ignore_ascii_case("never");
-                if let Some(video) = ch.video.as_mut() {
-                    if video.handles_render_transform() {
-                        video.set_render_transform(rt);
-                        true
-                    } else if !needs_rgb_upgrade {
-                        // CPU 帧或纯 YUV fit/zoom/offset 会在 step_channel 下一帧直接读取配置，零闪烁生效。
-                        true
+                if ch.video.is_none() && ch.paused_video_media.is_some() {
+                    // 已卸载的暂停视频保留原路径，等恢复时按最新 config 重建。
+                    true
+                } else {
+                    let is_dmabuf_passthrough = ch.video.as_ref().is_some_and(|v| {
+                        !v.handles_render_transform()
+                            && v.dmabuf_state().is_some_and(|s| s.is_dmabuf)
+                    }) || ch
+                        .current
+                        .as_ref()
+                        .is_some_and(|d| d.decoder.ends_with("(dmabuf)"));
+                    let has_non_default_transform = rt.rotation != Rotation::Deg0
+                        || (rt.brightness - 1.0).abs() > 1e-4
+                        || rt.fit != liuguang_core::fit::FitMode::Cover
+                        || (rt.zoom - 1.0).abs() > 1e-4
+                        || rt.offset_x.abs() > 1e-4
+                        || rt.offset_y.abs() > 1e-4;
+                    let needs_rgb_upgrade = is_dmabuf_passthrough
+                        && has_non_default_transform
+                        && !self
+                            .config
+                            .media
+                            .video_dmabuf_rgb
+                            .trim()
+                            .eq_ignore_ascii_case("never");
+                    let is_cpu_nv12_pixel_change = ch
+                        .video
+                        .as_ref()
+                        .is_some_and(|v| v.dmabuf_state().is_some_and(|s| !s.is_dmabuf))
+                        && (rt.rotation != Rotation::Deg0 || (rt.brightness - 1.0).abs() > 1e-4);
+                    if let Some(video) = ch.video.as_mut() {
+                        if video.handles_render_transform() {
+                            video.set_render_transform(rt);
+                            true
+                        } else {
+                            !needs_rgb_upgrade && !is_cpu_nv12_pixel_change
+                        }
                     } else {
                         false
                     }
-                } else {
-                    false
                 }
             } else {
                 false
@@ -6269,10 +6369,8 @@ impl Runtime {
             return Response::err(id, body);
         }
         let merged = plan.applied;
-        // 预演通过后才落到真实配置（写什么 == 运行时是什么）。
-        self.config = plan.config;
-        // 写前快照：万一**写后才**发现不一致（回读校验失败），用它回滚，
-        // 保证"失败路径下配置文件字节不变"（T37 验收）。
+        // 写前保留内存与磁盘双快照：写失败或回读校验失败时一起回滚。
+        let prev_config = std::mem::replace(&mut self.config, plan.config);
         let before_bytes = std::fs::read(&self.config_path).ok();
         match self.config.save_atomic(&self.config_path) {
             Ok(bytes) => {
@@ -6281,7 +6379,8 @@ impl Runtime {
                 // 调用方（TUI/CLI）应当看 `verified` 而不是 `saved`。
                 let verified = self.verify_saved_config();
                 if !verified {
-                    // **回滚**：回读不一致 ⇒ 把写坏的字节还原，宁可"没保存"也不留半截状态。
+                    // **回滚**：回读不一致 ⇒ 还原内存配置与磁盘字节，宁可"没保存"也不留半截状态。
+                    self.config = prev_config;
                     let restored = match &before_bytes {
                         Some(prev) => std::fs::write(&self.config_path, prev).is_ok(),
                         None => false,
@@ -6323,6 +6422,7 @@ impl Runtime {
                 )
             }
             Err(e) => {
+                self.config = prev_config;
                 let (kind, detail) = match &e {
                     liuguang_core::error::ConfigError::Io { source, .. }
                         if source.kind() == std::io::ErrorKind::PermissionDenied =>
@@ -6457,9 +6557,10 @@ impl Runtime {
         // fit/zoom/offset/rotation 覆盖。
         // **不得静默失效**：参数非法 → INVALID_PARAMS；输出未声明 → 现场建立条目，
         // 让 IPC 覆盖与配置文件等价（AUDIT §2.1）。
-        if let Err(body) = self.apply_overrides(&key, &params) {
-            return Response::err(id, body);
-        }
+        let transform_changed = match self.apply_overrides(&key, &params) {
+            Ok(changed) => changed,
+            Err(body) => return Response::err(id, body),
+        };
         // 只有真的带了 fit/zoom/offset/rotation/brightness 覆盖时才写配置：单纯换壁纸不该改文件。
         if params.fit.is_some()
             || params.zoom.is_some()
@@ -6500,6 +6601,7 @@ impl Runtime {
             entry,
             declared_path: params.path,
             pin: params.pin == Some(true),
+            transform_changed,
         });
         // 受理即落盘：`state.json` 的存在与"已受理"同步（重启后即使还没上屏，
         // 也不会退回上一次的壁纸；上屏完成时 `run_pending_sets` 会再存一次游标）。
@@ -6550,11 +6652,17 @@ impl Runtime {
         // 媒体库第一项），旧实现会让 `run_pending_sets` 再 `open` 一次解码器——
         // journal 里出现两条"视频解码管线已建立"、冷启动首次 set 多花几百毫秒。
         // 这里只补 pin/事件/落盘（下面共用同一段收尾逻辑）。
-        let already_showing = self.channels.get(&key).is_some_and(|ch| {
-            ch.current
-                .as_ref()
-                .is_some_and(|d| d.media == job.entry.path)
-        });
+        let already_showing = !job.transform_changed
+            && self.channels.get(&key).is_some_and(|ch| {
+                ch.degraded_reason.is_none()
+                    && (job.entry.kind != MediaKind::Video
+                        || ch.video.is_some()
+                        || ch.paused_video_media.is_some())
+                    && ch
+                        .current
+                        .as_ref()
+                        .is_some_and(|d| d.media == job.entry.path)
+            });
         let result = if already_showing {
             tracing::info!(
                 output = %key,
@@ -6811,6 +6919,16 @@ impl Runtime {
                         error = %err.message,
                         "恢复播放时重建视频管线失败"
                     );
+                    if err.code == ErrorKind::DeviceUnavailable {
+                        if let Some(ch) = self.channels.get_mut(key) {
+                            ch.paused_video_media = Some(media);
+                        }
+                    } else {
+                        self.handle_video_failure(
+                            key,
+                            &format!("恢复播放时重建视频管线失败: {}", err.message),
+                        );
+                    }
                 }
             }
         }
@@ -7060,12 +7178,17 @@ impl Runtime {
             );
         }
         // 暂停播放列表推进（与 handle_pause 同一套动作）。
+        let was_paused = self.channels.get(&key).map(|ch| ch.paused).unwrap_or(false);
         self.pause_video_supply(&key);
         // 解码 + 上屏；失败时把暂停状态回滚，避免"壁纸没换成却停住了"。
         if let Err(body) = self.show_image(&key, &path, true) {
             // 回滚必须**连播放器一起**恢复：只翻 `paused` 会让视频源仍处于
-            // pause 状态（`poll_frame` 恒 Pending）⇒ 10s 后被停摆看门狗判死。
-            self.resume_video_supply(&key, Instant::now());
+            // pause 状态（`poll_frame` 恒 Pending）⇒ 10s 后被停摆看门狗判死；
+            // 若原先本就因其它原因暂停，则保持暂停而不误恢复。
+            if !was_paused && !self.has_any_pause_reason(&key) {
+                self.resume_video_supply(&key, Instant::now());
+            }
+            self.sync_top_level_pause_state();
             return Response::err(id, body);
         }
         let switched = self
@@ -7100,7 +7223,10 @@ impl Runtime {
             .get_mut(&key)
             .and_then(|ch| ch.static_wallpaper.take())
             .is_some();
-        self.resume_video_supply(&key, Instant::now());
+        if !self.has_any_pause_reason(&key) {
+            self.resume_video_supply(&key, Instant::now());
+        }
+        self.sync_top_level_pause_state();
         // 立刻推进到播放列表的下一项：否则静态图会一直留在屏幕上直到下一个调度点。
         let advanced = match self.switch_next(&key, true) {
             Ok(()) => true,
@@ -7236,9 +7362,17 @@ impl Runtime {
                 self.sync_performance();
                 self.log_pending_config("reload");
                 // 同步转场默认值与各通道调度间隔。
-                if self.config.transition.effect != liuguang_core::config::TransitionEffect::None {
-                    self.transitions.duration_ms = self.config.transition.duration_ms;
-                }
+                self.transitions = transition_settings_from_config(&self.config.transition);
+                self.caps =
+                    crate::compat::HardwareCaps::detect(self.config.media.transcode_max_width);
+                let startup = startup_consumer(&self.config, self.backend.as_ref(), &self.caps);
+                self.transcode.reconfigure(
+                    &self.config.media.transcode,
+                    std::env::var("LIUGUANG_TRANSCODE").ok().as_deref(),
+                    &self.config.media.transcode_crf_or_bitrate,
+                    self.config.media.transcode_max_width,
+                    startup,
+                );
                 let keys: Vec<String> = self.channels.keys().cloned().collect();
                 // T68：播放列表也是配置的一部分 ⇒ reload 必须重新装载，否则
                 // "改了配置里的播放列表、reload 之后还是播旧的"。
@@ -7368,6 +7502,31 @@ impl Runtime {
                 ),
             );
         }
+        if parse_transition_effect(&params.effect).is_none() {
+            return Response::err(
+                id,
+                ErrorBody::new(
+                    ErrorKind::InvalidParams,
+                    format!("不支持的转场效果: {}", params.effect),
+                ),
+            );
+        }
+        if let Some(e) = params.easing.as_deref()
+            && parse_easing(e).is_none()
+        {
+            return Response::err(
+                id,
+                ErrorBody::new(ErrorKind::InvalidParams, format!("不支持的缓动函数: {e}")),
+            );
+        }
+        if let Some(d) = params.direction.as_deref()
+            && parse_transition_direction(d).is_none()
+        {
+            return Response::err(
+                id,
+                ErrorBody::new(ErrorKind::InvalidParams, format!("不支持的转场方向: {d}")),
+            );
+        }
         self.transitions.effect = params.effect.clone();
         self.transitions.duration_ms = params.duration_ms;
         if let Some(e) = params.easing {
@@ -7448,10 +7607,13 @@ impl Runtime {
         if !self.transcode.disabled_by_config() {
             roots.push(crate::compat::cache_dir());
         }
-        let allowed = roots.iter().any(|root| {
-            let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
-            canonical.starts_with(&root)
-        });
+        let allowed = roots
+            .iter()
+            .filter(|root| !root.as_os_str().is_empty())
+            .any(|root| {
+                let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+                !root.as_os_str().is_empty() && canonical.starts_with(&root)
+            });
         if !allowed {
             return Err(ErrorBody::new(
                 ErrorKind::PermissionDenied,
@@ -7685,28 +7847,38 @@ impl Runtime {
 
         let Some(toplevel) = self.backend.fullscreen_toplevel() else {
             // 没有全屏窗口**或**后端不提供该信息：两者都按"不在全屏"处理，
-            // 但已经因全屏暂停的通道必须恢复（否则协议消失时壁纸卡死）。
+            // 并清除滞回计时与抑制签名，避免下次瞬态误触。
+            self.fullscreen_since = None;
+            self.fullscreen_suppressed = None;
             if self.fullscreen_active {
                 self.fullscreen_active = false;
-                self.fullscreen_since = None;
                 self.fullscreen_info = None;
                 self.resume_after_fullscreen();
             }
             return;
         };
 
+        let described = toplevel.describe();
+        if self.fullscreen_suppressed.as_deref() == Some(described.as_str()) {
+            return;
+        }
+        if self.fullscreen_suppressed.is_some() {
+            self.fullscreen_suppressed = None;
+        }
+
         if self.fullscreen_active {
             // 仍在全屏：刷新快照（标题/输出可能变），保持暂停。
             self.fullscreen_info = Some(toplevel.clone());
             if self.fullscreen_exit_confirmed(now, &toplevel) {
                 tracing::info!(
-                    window = %toplevel.describe(),
+                    window = %described,
                     "全屏窗口已退出（合成器未发状态事件，由 niri IPC 兜底确认）：恢复视频供给"
                 );
                 self.fullscreen_active = false;
                 self.fullscreen_since = None;
                 self.fullscreen_info = None;
                 self.fullscreen_verify_due = None;
+                self.fullscreen_suppressed = Some(described);
                 self.resume_after_fullscreen();
             }
             return;
@@ -8206,6 +8378,35 @@ const VIDEO_LOOP_PTS_TOLERANCE: Duration = Duration::from_millis(250);
 /// 重扫（`tick` 在视频播放时是毫秒级频率）。
 const PLAYLIST_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
+/// 从配置段构造运行期 [`TransitionSettings`]。
+fn transition_settings_from_config(
+    cfg: &liuguang_core::config::TransitionConfig,
+) -> TransitionSettings {
+    TransitionSettings {
+        effect: match cfg.effect {
+            liuguang_core::config::TransitionEffect::Fade => "fade".into(),
+            liuguang_core::config::TransitionEffect::Slide => "slide".into(),
+            liuguang_core::config::TransitionEffect::Wipe => "wipe".into(),
+            liuguang_core::config::TransitionEffect::Circle => "circle".into(),
+            liuguang_core::config::TransitionEffect::Random => "random".into(),
+            liuguang_core::config::TransitionEffect::None => "none".into(),
+        },
+        duration_ms: cfg.duration_ms,
+        easing: match cfg.easing {
+            liuguang_core::config::Easing::Linear => "linear".into(),
+            liuguang_core::config::Easing::EaseIn => "ease-in".into(),
+            liuguang_core::config::Easing::EaseOut => "ease-out".into(),
+            liuguang_core::config::Easing::EaseInOut => "ease-in-out".into(),
+        },
+        direction: cfg.direction.map(|d| match d {
+            liuguang_core::config::TransitionDirection::Left => "left".into(),
+            liuguang_core::config::TransitionDirection::Right => "right".into(),
+            liuguang_core::config::TransitionDirection::Up => "up".into(),
+            liuguang_core::config::TransitionDirection::Down => "down".into(),
+        }),
+    }
+}
+
 /// 按扩展名判定媒体类型（**唯一规则**：`set_wallpaper` 与播放列表共用）。
 ///
 /// 与旧 `handle_set` 的内联判定保持一致（`mp4/m4v/mov` 为视频，其余按图片处理）；
@@ -8622,6 +8823,7 @@ pub fn run(opts: DaemonOptions) -> Result<(), String> {
     }
 
     handle.shutdown();
+    runtime.flush_config_write(Instant::now() + Runtime::CONFIG_WRITE_DEBOUNCE);
     runtime.cancel_scans();
     // 退出前把后台转码的 ffmpeg 进程组杀掉：孤儿会继续写 `.part`（t21 F6）。
     runtime.transcode.shutdown();
@@ -11950,28 +12152,23 @@ mod tests {
     #[test]
     fn producer_kind_follows_backend_capability_not_env() {
         use super::{ProducerKind, producer_kind};
-        // 后端支持直通 + 未闩死 + 不旋转 ⇒ 才允许按环境尝试直通。
-        assert_eq!(
-            producer_kind(false, true, Rotation::Deg0),
-            ProducerKind::Auto
-        );
+        // 后端支持直通 + 未闩死 + 不需像素变换 ⇒ 才允许按环境尝试直通。
+        assert_eq!(producer_kind(false, true, false), ProducerKind::Auto);
         // 后端**不**支持直通（当前真实 DRM 后端）：即使 force_cpu=false 也必须 CPU。
         assert_eq!(
-            producer_kind(false, false, Rotation::Deg0),
+            producer_kind(false, false, false),
             ProducerKind::Cpu,
             "旧 unit 遗留 LIUGUANG_VIDEO_DMABUF=1 不得让生产者按直通协商"
         );
         // 通道已闩死：无论后端能力如何都是 CPU。
         assert_eq!(
-            producer_kind(true, true, Rotation::Deg0),
+            producer_kind(true, true, false),
             ProducerKind::Cpu,
             "被拒后闩死的既有语义必须保留"
         );
-        // 旋转要像素级处理：后端支持直通时仍走 RGBA。
-        assert_eq!(
-            producer_kind(false, true, Rotation::Deg90),
-            ProducerKind::Rgba
-        );
+        // 旋转/亮度需要像素级处理：哪怕已闩死直通也必须走 RGBA，防止 NV12 送进像素变换崩溃。
+        assert_eq!(producer_kind(false, true, true), ProducerKind::Rgba);
+        assert_eq!(producer_kind(true, false, true), ProducerKind::Rgba);
     }
 
     /// **类型化映射 + 负对照**：只有 `DmaBufRejected` 才带 `DMABUF_REJECTED`
@@ -12938,6 +13135,7 @@ mod tests {
             },
             declared_path: png.display().to_string(),
             pin: false,
+            transform_changed: false,
         });
         rt.prime_first_frame();
         assert!(
@@ -12978,6 +13176,7 @@ mod tests {
             },
             declared_path: png.display().to_string(),
             pin: false,
+            transform_changed: false,
         });
         rt.run_pending_sets();
         rt.flush_pending_applied();
@@ -15888,6 +16087,7 @@ mod tests {
             },
             declared_path: b.display().to_string(),
             pin: false,
+            transform_changed: false,
         });
         ok_json(
             &mut rt,

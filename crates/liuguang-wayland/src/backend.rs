@@ -347,8 +347,18 @@ impl WaylandBackend {
                 let remaining = deadline.saturating_duration_since(now);
                 let timeout_ms = remaining.as_millis().min(1000) as i32;
                 if sys::poll_readable(guard.connection_fd().as_raw_fd(), timeout_ms) {
-                    // WouldBlock 也会安全返回，下一轮 dispatch 处理。
-                    let _ = guard.read();
+                    if let Err(err) = guard.read() {
+                        let would_block = matches!(
+                            &err,
+                            wayland_client::backend::WaylandError::Io(io_err)
+                                if io_err.kind() == std::io::ErrorKind::WouldBlock
+                        );
+                        if !would_block {
+                            self.wl.borrow_mut().exited = true;
+                            tracing::debug!("wayland 读取失败（视为合成器断连）: {err}");
+                            return;
+                        }
+                    }
                 }
                 // guard Drop 自动撤销 read 声明。
             } else {
@@ -442,18 +452,14 @@ impl WaylandBackend {
                 // 触发合成器发 configure 的唯一信号。少了这句就永远收不到
                 // configure，池建不出来，present 会卡在"等待 configure"。
                 surface.commit();
-                // 分数缩放：viewport 负责把 buffer 映射到 configure 尺寸，
-                // fractional_scale 告诉我们要按什么倍率出 buffer。
-                if let Some(vp) = viewporter.as_ref() {
-                    if let Some(fs) = fractional_manager.as_ref() {
-                        entry.viewport = Some(vp.get_viewport(&surface, &self.qh, ()));
-                        entry.fractional = Some(fs.get_fractional_scale(
-                            &surface,
-                            &self.qh,
-                            FractionalUdata(*global),
-                        ));
-                    }
-                }
+                // 分数缩放与 viewport 互相独立：只要有 viewporter 就建 viewport，
+                // 避免只有 wp_viewporter、没有 fractional_scale 时 DMA-BUF 与快路径退化。
+                entry.viewport = viewporter
+                    .as_ref()
+                    .map(|vp| vp.get_viewport(&surface, &self.qh, ()));
+                entry.fractional = fractional_manager.as_ref().map(|fs| {
+                    fs.get_fractional_scale(&surface, &self.qh, FractionalUdata(*global))
+                });
                 entry.surface = Some(surface);
                 entry.layer = Some(layer);
                 created = true;
@@ -549,11 +555,10 @@ impl WaylandBackend {
             let Some(e) = wl.outputs.get(&global) else {
                 return false;
             };
-            let Some((cfg_w, cfg_h)) = e.cfg else {
+            if e.cfg.is_none() {
                 return false;
             };
-            let fills_surface =
-                dst.0 == 0 && dst.1 == 0 && dst.2 >= u64::from(cfg_w) && dst.3 >= u64::from(cfg_h);
+            let fills_surface = entry_fills_surface(e, dst);
             let viewport_ok = e.viewport.as_ref().is_some_and(Proxy::is_alive);
             if let Some(format) = upload_format.filter(|_| fills_surface && viewport_ok) {
                 if let Some(fp) = e
@@ -588,8 +593,7 @@ impl WaylandBackend {
             })?;
 
             // dst 是否铺满整个 surface（daemon 的 fit 已把 cover/zoom 算成整屏）。
-            let fills_surface =
-                dst.0 == 0 && dst.1 == 0 && dst.2 >= u64::from(cfg_w) && dst.3 >= u64::from(cfg_h);
+            let fills_surface = entry_fills_surface(entry, dst);
             let viewport_ok = entry.viewport.as_ref().is_some_and(Proxy::is_alive);
             let mut fast = upload_format.filter(|_| fills_surface && viewport_ok);
 
@@ -700,18 +704,25 @@ impl WaylandBackend {
             // 快路径：buffer 就是帧本身（未缩放），用 viewport 表达
             // 「帧内矩形 → 整屏」的映射；buffer_scale 必须是 1，否则
             // source/destination 的单位会被再除一次。
-            if let Some(viewport) = entry.viewport.as_ref().filter(|_| fast.is_some()) {
-                if viewport.is_alive() {
-                    viewport.set_source(
-                        src.0 as f64 / 65536.0,
-                        src.1 as f64 / 65536.0,
-                        src.2 as f64 / 65536.0,
-                        src.3 as f64 / 65536.0,
-                    );
+            let (sx, sy, sw, sh) = clamp_viewport_source(src, pw, ph);
+            if let Some(viewport) = entry.viewport.as_ref().filter(|v| v.is_alive()) {
+                if fast.is_some() {
+                    viewport.set_source(sx, sy, sw, sh);
                     viewport.set_destination(
                         i32::try_from(cfg_w).unwrap_or(i32::MAX),
                         i32::try_from(cfg_h).unwrap_or(i32::MAX),
                     );
+                } else {
+                    // 切回慢路径时必须清空上一帧残留的 source 裁切（否则 out_of_buffer 断连）。
+                    viewport.set_source(-1.0, -1.0, -1.0, -1.0);
+                    if entry.has_fractional_scale() {
+                        viewport.set_destination(
+                            i32::try_from(cfg_w).unwrap_or(i32::MAX),
+                            i32::try_from(cfg_h).unwrap_or(i32::MAX),
+                        );
+                    } else {
+                        viewport.set_destination(-1, -1);
+                    }
                 }
             }
             let scale = if fast.is_some() {
@@ -719,18 +730,7 @@ impl WaylandBackend {
             } else {
                 entry.buffer_scale()
             };
-            let fractional = entry.has_fractional_scale();
             surface.set_buffer_scale(scale);
-            if fast.is_none() && fractional {
-                if let Some(viewport) = entry.viewport.as_ref() {
-                    if viewport.is_alive() {
-                        viewport.set_destination(
-                            i32::try_from(cfg_w).unwrap_or(i32::MAX),
-                            i32::try_from(cfg_h).unwrap_or(i32::MAX),
-                        );
-                    }
-                }
-            }
             surface.attach(Some(&buffer), 0, 0);
             if surface.version() >= 4 {
                 surface.damage_buffer(0, 0, pw as i32, ph as i32);
@@ -832,27 +832,55 @@ impl WaylandBackend {
             tracing::trace!("wayland frame 背压超时（100ms），放行 DMA-BUF 提交");
         }
 
-        // 尚未 configure 就提交没有意义（surface 没有尺寸）。
-        let cfg = {
+        // 等待 layer surface 完成首次 configure（热插拔刚建立的输出需要等一轮事件）。
+        let cfg_ready = |wl: &WlState| wl.outputs.get(&global).is_some_and(|e| e.cfg.is_some());
+        if !self.wait_for(Instant::now() + SLOT_WAIT, cfg_ready) {
+            return Err(DisplayError::Failed {
+                operation: "present_dmabuf",
+                message: "layer surface 未收到 configure（合成器未确认壁纸层尺寸）".into(),
+            });
+        }
+        let (cfg, fills, needs_viewport, viewport_ok) = {
             let wl = self.wl.borrow();
-            wl.outputs
+            let entry = wl
+                .outputs
                 .get(&global)
-                .and_then(|e| e.cfg)
-                .ok_or_else(|| DisplayError::Failed {
-                    operation: "present_dmabuf",
-                    message: "layer surface 尚未完成首次 configure".into(),
-                })?
+                .ok_or_else(|| DisplayError::OutputNotFound(output.clone()))?;
+            let cfg = entry.cfg.ok_or_else(|| DisplayError::Failed {
+                operation: "present_dmabuf",
+                message: "layer surface 尚未完成首次 configure".into(),
+            })?;
+            let fills = entry_fills_surface(entry, dst);
+            let src_is_full = src
+                == (
+                    0,
+                    0,
+                    u64::from(frame.width) << 16,
+                    u64::from(frame.height) << 16,
+                );
+            let scale_1 = u32::try_from(entry.scale.max(1)).unwrap_or(1);
+            let buffer_matches_cfg = frame.width == cfg.0.saturating_mul(scale_1)
+                && frame.height == cfg.1.saturating_mul(scale_1)
+                && !entry.has_fractional_scale();
+            let needs_viewport = !src_is_full || !buffer_matches_cfg;
+            let viewport_ok = entry.viewport.as_ref().is_some_and(Proxy::is_alive);
+            (cfg, fills, needs_viewport, viewport_ok)
         };
 
         // `wp_viewport.set_destination` 只能表达「整 surface 铺满」，没有偏移量；
         // Fit=contain 这类要留黑边的布局只能走 CPU 合成（daemon 收到拒绝后闩死
         // 直通并重开 CPU 管线）。判据与 CPU 路径的 `fills_surface` 一致。
-        if !(dst.0 == 0 && dst.1 == 0 && dst.2 >= u64::from(cfg.0) && dst.3 >= u64::from(cfg.1)) {
+        if !fills {
             return Err(DisplayError::DmaBufRejected {
                 reason: format!(
-                    "目标矩形不铺满屏幕（dst=({},{}) {}x{} < 逻辑 {}x{}），需要 CPU 合成",
+                    "目标矩形不铺满屏幕（dst=({},{}) {}x{}，逻辑 {}x{}），需要 CPU 合成",
                     dst.0, dst.1, dst.2, dst.3, cfg.0, cfg.1
                 ),
+            });
+        }
+        if needs_viewport && !viewport_ok {
+            return Err(DisplayError::DmaBufRejected {
+                reason: "合成器不支持 wp_viewporter，DMA-BUF 无法缩放或裁切".into(),
             });
         }
 
@@ -1035,19 +1063,17 @@ impl WaylandBackend {
                 return Err(DisplayError::OutputNotFound(output));
             };
             if let Some(viewport) = entry.viewport.as_ref().filter(|v| v.is_alive()) {
-                viewport.set_source(
-                    src.0 as f64 / 65536.0,
-                    src.1 as f64 / 65536.0,
-                    src.2 as f64 / 65536.0,
-                    src.3 as f64 / 65536.0,
-                );
+                let (sx, sy, sw, sh) = clamp_viewport_source(src, frame.width, frame.height);
+                viewport.set_source(sx, sy, sw, sh);
                 viewport.set_destination(
                     i32::try_from(cfg.0).unwrap_or(i32::MAX),
                     i32::try_from(cfg.1).unwrap_or(i32::MAX),
                 );
+                // 有 viewport 时 buffer_scale 必须是 1（否则单位被再除一次）。
+                surface.set_buffer_scale(1);
+            } else {
+                surface.set_buffer_scale(entry.buffer_scale());
             }
-            // 有 viewport 时 buffer_scale 必须是 1（否则单位被再除一次）。
-            surface.set_buffer_scale(1);
             surface.attach(Some(&buffer), 0, 0);
             if surface.version() >= 4 {
                 surface.damage_buffer(0, 0, width, height);
@@ -1167,7 +1193,7 @@ impl DisplayBackend for WaylandBackend {
             .outputs
             .get(&global)
             .ok_or_else(|| DisplayError::OutputNotFound(output.clone()))?;
-        let current = entry.current_mode.ok_or_else(|| {
+        let current = entry.current_mode.or(entry.preferred_mode).ok_or_else(|| {
             DisplayError::DeviceUnavailable("合成器尚未报告该输出的当前模式".into())
         })?;
         match selection {
@@ -1200,11 +1226,12 @@ impl DisplayBackend for WaylandBackend {
 
     fn connector_connected(&self, name: &str) -> Result<bool, DisplayError> {
         let wl = self.wl.borrow();
-        match wl.outputs.values().find(|e| e.key() == name) {
-            // 活着 or 热拔中（dead 但条目仍在）→ bool；从未见过 → NotFound
-            // （镜像 DRM 语义：daemon 对 Err 是 warn+skip，良性）。
-            Some(e) => Ok(!e.dead),
-            None => Err(DisplayError::OutputNotFound(OutputId::new(name))),
+        if wl.outputs.values().any(|e| !e.dead && e.key() == name) {
+            Ok(true)
+        } else if wl.outputs.values().any(|e| e.key() == name) {
+            Ok(false)
+        } else {
+            Err(DisplayError::OutputNotFound(OutputId::new(name)))
         }
     }
 
@@ -1277,6 +1304,18 @@ impl DisplayBackend for WaylandBackend {
         wl.dmabuf_supports(fourcc, modifier)
     }
 
+    fn dmabuf_modifiers_for(&self, fourcc: u32) -> Vec<u64> {
+        if self.ensure_alive().is_err() {
+            return Vec::new();
+        }
+        let wl = self.wl.borrow();
+        wl.dmabuf_formats
+            .iter()
+            .find(|f| f.fourcc == fourcc)
+            .map(|f| f.modifiers.clone())
+            .unwrap_or_default()
+    }
+
     fn supports_dmabuf_scanout(&self) -> bool {
         self.ensure_alive().is_ok() && self.wl.borrow().dmabuf_available()
     }
@@ -1326,6 +1365,36 @@ impl DisplayBackend for WaylandBackend {
 // ---------------------------------------------------------------------------
 // rect 归一化 + 单元测试
 // ---------------------------------------------------------------------------
+
+/// 判断 `dst`（模式物理像素矩形）是否铺满整张层表面，决定能否走 fast-path/DMA-BUF。
+fn entry_fills_surface(entry: &OutputEntry, dst: DstRect) -> bool {
+    let (tw, th) = entry
+        .current_mode
+        .map(|m| (m.width, m.height))
+        .or_else(|| entry.buffer_dims())
+        .or(entry.cfg)
+        .unwrap_or((0, 0));
+    dst.0 == 0
+        && dst.1 == 0
+        && dst.2.saturating_add(1) >= u64::from(tw)
+        && dst.3.saturating_add(1) >= u64::from(th)
+}
+
+/// 将 16.16 定点 `src` 钳制并量化到 24.8 `wl_fixed` 合法区间，确保 `x + w <= frame_w` 且 `y + h <= frame_h`。
+fn clamp_viewport_source(src: SrcRect, frame_w: u32, frame_h: u32) -> (f64, f64, f64, f64) {
+    let max_x = i64::from(frame_w.max(1)) * 256;
+    let max_y = i64::from(frame_h.max(1)) * 256;
+    let x24 = ((src.0 >> 8) as i64).clamp(0, max_x.saturating_sub(1));
+    let y24 = ((src.1 >> 8) as i64).clamp(0, max_y.saturating_sub(1));
+    let w24 = ((src.2 >> 8) as i64).clamp(1, (max_x - x24).max(1));
+    let h24 = ((src.3 >> 8) as i64).clamp(1, (max_y - y24).max(1));
+    (
+        x24 as f64 / 256.0,
+        y24 as f64 / 256.0,
+        w24 as f64 / 256.0,
+        h24 as f64 / 256.0,
+    )
+}
 
 /// daemon 的 `present`（未拟合）路径给 (0,0,0,0) 矩形；展开为帧/缓冲全幅。
 /// `present_fitted` 收到的 src 是 16.16 定点；dst 是模式像素。
@@ -1676,5 +1745,15 @@ mod tests {
             .collect();
         assert_eq!(found, vec!["wayland-0", "wayland-1", "wayland-10"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clamp_viewport_source_never_overflows_24_8_fixed() {
+        let (x, y, w, h) =
+            clamp_viewport_source((128, 128, (3840 << 16), (2160 << 16)), 3840, 2160);
+        assert!(x >= 0.0 && y >= 0.0);
+        assert!(w >= 1.0 / 256.0 && h >= 1.0 / 256.0);
+        assert!((x * 256.0).round() + (w * 256.0).round() <= 3840.0 * 256.0);
+        assert!((y * 256.0).round() + (h * 256.0).round() <= 2160.0 * 256.0);
     }
 }

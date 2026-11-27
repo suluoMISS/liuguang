@@ -601,7 +601,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "liuguang-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "clap",
  "serde",
@@ -611,7 +611,7 @@ dependencies = [
 
 [[package]]
 name = "liuguang-gui"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-channel",
  "gdk-pixbuf",
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "liuguang-ipc"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "nix",
  "serde",

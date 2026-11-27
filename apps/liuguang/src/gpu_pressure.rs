@@ -316,6 +316,7 @@ impl Controller {
         let was_engaged = self.is_engaged();
         let Some(mut next_guard) = Guard::new(above, below) else {
             self.guard = None;
+            self.sampler.stop();
             return if was_engaged {
                 Action::Resume
             } else {

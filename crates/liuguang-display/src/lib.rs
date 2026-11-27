@@ -364,6 +364,14 @@ pub trait DisplayBackend {
         true
     }
 
+    /// 返回后端为指定 DMA-BUF `fourcc` 广播的显式 modifier 列表（顺序按后端报告）。
+    ///
+    /// 用于转换器（如 NV12 → XRGB8888）直接按合成器接受的 modifier 分配输出 BO。
+    /// 默认返回空（调用方自行选择默认分配策略）。
+    fn dmabuf_modifiers_for(&self, _fourcc: u32) -> Vec<u64> {
+        Vec::new()
+    }
+
     /// 后端能否直接消费解码器原生的 **YUV（NV12）CPU 帧**。
     ///
     /// DRM/KMS 平面可以扫 YUV，扫描输出时由硬件做 YUV→RGB；`wl_shm` 只接受

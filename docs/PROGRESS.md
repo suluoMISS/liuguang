@@ -1,8 +1,8 @@
 # 项目进度与演进路线
 
-当前版本：**0.3.2**（协议：`MIT`，主仓库：<https://github.com/suluoMISS/liuguang>）。
+当前版本：**0.3.3**（协议：`MIT`，主仓库：<https://github.com/suluoMISS/liuguang>）。
 
-## 1. 当前状态（0.3.2）
+## 1. 当前状态（0.3.3）
 
 - **零门槛桌面首启与 GUI 服务控制**：桌面首次启动自动初始化默认配置与壁纸库目录，GUI 内置 `systemd --user` 启停/自启/初始化面板与一键处理横幅，并支持热加载手工补写的 `[library]` 配置；
 

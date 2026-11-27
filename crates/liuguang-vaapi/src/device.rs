@@ -50,6 +50,10 @@ impl VaDevice {
         // SAFETY: display 非空且由本函数创建；两个 out 指针指向本地变量。
         let status = unsafe { ffi::vaInitialize(display, &raw mut major, &raw mut minor) };
         if status != ffi::VA_STATUS_SUCCESS {
+            // SAFETY: display 已由 `vaGetDisplayDRM` 创建，初始化失败需终止句柄防泄漏。
+            unsafe {
+                ffi::vaTerminate(display);
+            }
             return Err(VaapiError::Init {
                 node: node.to_path_buf(),
                 message: va_status_text(status),

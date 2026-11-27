@@ -534,12 +534,14 @@ pub fn refresh(app: &Rc<App>, view: &Rc<PlaylistsView>) {
     // 输出下拉（保持"不绑定"在第一项并保留当前选择）。
     sync_outputs(app, view);
 
-    // 当前编辑的播放列表被删掉了 ⇒ 清空编辑器。
+    // 当前编辑的播放列表被删掉了 ⇒ 清空编辑器；若仍在且未标脏，同步守护进程最新内容。
     if let Some(current) = view.current.borrow().clone() {
         if !playlists.iter().any(|p| p.id == current) {
             view.current.borrow_mut().take();
             view.dirty.set(false);
             view.editor.set_visible_child_name("empty");
+        } else if !view.dirty.get() {
+            load_playlist(app, view, &current);
         }
     }
 
@@ -620,33 +622,66 @@ pub fn load_playlist(app: &Rc<App>, view: &Rc<PlaylistsView>, id: &str) {
     view.syncing.set(was_syncing);
 }
 
-/// 同步输出列表下拉选项，同时尽量保留用户当前选中的输出。
+/// 同步输出列表下拉选项，同时尽量保留用户当前选中的输出（包括暂未连接的输出）。
 pub fn sync_outputs(app: &Rc<App>, view: &Rc<PlaylistsView>) {
     let prev_selected = {
         let index = view.output.selected() as usize;
         view.output_ids.borrow().get(index).cloned().flatten()
     };
+    let bound_selected = view.current.borrow().as_ref().and_then(|cur_id| {
+        app.state
+            .borrow()
+            .playlists
+            .iter()
+            .find(|p| &p.id == cur_id)
+            .and_then(|p| p.output.clone())
+    });
+    let preserve = prev_selected.clone().or(bound_selected);
+
     let outputs = app.state.borrow().outputs.clone();
     let mut entries = vec![String::from("不绑定（跟随默认）")];
     let mut ids: Vec<Option<String>> = vec![None];
     for output in &outputs {
-        if !output.connected {
-            continue;
+        if output.connected {
+            entries.push(output.name.clone());
+        } else {
+            entries.push(format!("{}（未连接）", output.name));
         }
-        entries.push(output.name.clone());
         ids.push(Some(output.name.clone()));
     }
-    let strings: Vec<&str> = entries.iter().map(String::as_str).collect();
+    if let Some(sel) = preserve.as_deref()
+        && !ids.iter().any(|id| id.as_deref() == Some(sel))
+    {
+        entries.push(format!("{sel}（未连接）"));
+        ids.push(Some(sel.to_owned()));
+    }
+
+    let model_same = *view.output_ids.borrow() == ids
+        && view
+            .output
+            .model()
+            .and_then(|m| m.downcast::<gtk::StringList>().ok())
+            .is_some_and(|list| {
+                list.n_items() as usize == entries.len()
+                    && entries
+                        .iter()
+                        .enumerate()
+                        .all(|(i, s)| list.string(i as u32).as_deref() == Some(s.as_str()))
+            });
+
     let was_syncing = view.syncing.get();
     view.syncing.set(true);
-    view.output.set_model(Some(&gtk::StringList::new(&strings)));
+    if !model_same {
+        let strings: Vec<&str> = entries.iter().map(String::as_str).collect();
+        view.output.set_model(Some(&gtk::StringList::new(&strings)));
+        *view.output_ids.borrow_mut() = ids.clone();
+    }
     let restored = prev_selected
         .as_deref()
         .and_then(|sel| ids.iter().position(|id| id.as_deref() == Some(sel)))
         .unwrap_or(0);
     view.output
         .set_selected(u32::try_from(restored).unwrap_or(0));
-    *view.output_ids.borrow_mut() = ids;
     view.syncing.set(was_syncing);
 }
 

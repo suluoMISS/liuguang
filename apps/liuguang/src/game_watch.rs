@@ -127,6 +127,21 @@ const WINE_INFRA_EXES: &[&str] = &[
     "winecfg.exe",
     "control.exe",
     "uninstaller.exe",
+    "xalia.exe",
+    "iexplore.exe",
+    "winebrowser.exe",
+    "wineserver.exe",
+    "spoolsv.exe",
+    "mscorsvw.exe",
+    "ngen.exe",
+    "dxdiag.exe",
+    "dpnsvr.exe",
+    "regsvr32.exe",
+    "winepath.exe",
+    "winhlp32.exe",
+    "wordpad.exe",
+    "hh.exe",
+    "crashhandler.exe",
 ];
 
 /// shell / 编辑器 / 浏览器 / 文件管理器等工具：它们的 cmdline 可能恰好出现
@@ -1260,6 +1275,20 @@ mod tests {
             "WeChat.exe",
             &["wine64", "C:\\Program Files\\Tencent\\WeChat\\WeChat.exe"],
             &[],
+        );
+        fake_proc(
+            &root,
+            15,
+            "xalia.exe",
+            &["C:\\Program Files\\xalia\\xalia.exe"],
+            &["WINEPREFIX=/home/x/.wine"],
+        );
+        fake_proc(
+            &root,
+            16,
+            "iexplore.exe",
+            &["C:\\windows\\system32\\iexplore.exe"],
+            &["WINEPREFIX=/home/x/.wine"],
         );
         let hits = Detector::new(Vec::new(), Vec::new()).scan_proc(&root);
         assert!(

@@ -75,10 +75,12 @@ use crate::{VaapiError, export};
 
 /// Y 平面：单通道 8 bit。
 const DRM_FORMAT_R8: u32 = 0x2020_3852;
-/// UV 平面（NVIDIA 方言，U 在前）。
+/// UV 平面（NVIDIA 方言，或通用 LE 解释 `[15:0] R:G`）。
 const DRM_FORMAT_RG88: u32 = 0x3838_4752;
-/// UV 平面（Mesa/Intel 方言，V 在前）。
+/// UV 平面（Mesa/Intel 方言：`[15:0] G:R` LE，内存字节序 `[U, V]`）。
 const DRM_FORMAT_GR88: u32 = 0x3838_5247;
+/// DRM 隐式 modifier（`DRM_FORMAT_MOD_INVALID`），`0` 则是 `DRM_FORMAT_MOD_LINEAR`。
+const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
 const EGL_PLATFORM_GBM_KHR: u32 = 0x31D7;
 const EGL_LINUX_DMA_BUF_EXT: u32 = 0x3270;
@@ -178,15 +180,15 @@ void main() {
 /// UV 平面的 fourcc 方言。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UvDialect {
-    /// NVIDIA 方言：`DRM_FORMAT_RG88`，U/V 顺序已正确，不需要交换。
+    /// NVIDIA 方言：`DRM_FORMAT_RG88`（NVIDIA 专有 EGL 把它映射到 GL_RG8；标准 DRM 驱动则 `.r=V, .g=U` 需交换）。
     Rg88,
-    /// Mesa/Intel 方言：`DRM_FORMAT_GR88`，采样到的 `.r` 是 V、`.g` 是 U，需要交换。
+    /// Mesa/Intel/AMD 标准 DRM 方言：`DRM_FORMAT_GR88`（`[15:0] G:R` 小端，内存字节 0=U→`.r`，字节 1=V→`.g`，不交换）。
     Gr88,
 }
 
 impl UvDialect {
-    /// 首选方言：本项目跑 NVIDIA（NVDEC 导出 `NV12` + block-linear），先试这个。
-    const PREFERRED: Self = Self::Rg88;
+    /// 首选方言：Mesa/Intel/AMD 原生认 DRM 标准的 `GR88`；NVIDIA 拒掉 `GR88` 后会精确回退 `RG88`。
+    const PREFERRED: Self = Self::Gr88;
 
     fn fourcc(self) -> u32 {
         match self {
@@ -196,10 +198,10 @@ impl UvDialect {
     }
 
     /// 采样到这个方言时是否需要把 `.rg` 交换成 `.gr`。
-    fn swaps_uv(self) -> bool {
+    fn swaps_uv(self, is_nvidia: bool) -> bool {
         match self {
-            Self::Rg88 => false,
-            Self::Gr88 => true,
+            Self::Gr88 => false,
+            Self::Rg88 => !is_nvidia,
         }
     }
 
@@ -294,8 +296,11 @@ fn push_plane_attributes(attributes: &mut Vec<i32>, plane: &PlaneDesc) {
         EGL_PLANE0_PITCH,
         plane.pitch as i32,
     ]);
-    if let Some(modifier) = plane.modifier.filter(|value| *value != 0) {
-        // modifier 是 64 位，EGL 用 LO/HI 两个 32 位属性传；0（隐式）时不能带。
+    if let Some(modifier) = plane
+        .modifier
+        .filter(|value| *value != DRM_FORMAT_MOD_INVALID)
+    {
+        // modifier 是 64 位，EGL 用 LO/HI 两个 32 位属性传；DRM_FORMAT_MOD_INVALID 时不能带（0 是 LINEAR，合法可带）。
         attributes.extend([
             EGL_PLANE0_MODIFIER_LO,
             (modifier as u32) as i32,
@@ -832,7 +837,10 @@ impl Renderer {
             height,
         };
         renderer.attach_surface()?;
-        renderer.build_program()?;
+        if let Err(err) = renderer.build_program() {
+            renderer.release();
+            return Err(err);
+        }
         renderer.release();
         Ok(renderer)
     }
@@ -1352,8 +1360,62 @@ fn allocate_output(
     node: &Path,
     width: u32,
     height: u32,
+    preferred_modifiers: &[u64],
 ) -> Result<gbm::BufferObject<()>, VaapiError> {
     use gbm::{BufferObjectFlags, Format};
+
+    let explicit_mods: Vec<gbm::Modifier> = preferred_modifiers
+        .iter()
+        .copied()
+        .filter(|m| *m != DRM_FORMAT_MOD_INVALID)
+        .map(gbm::Modifier::from)
+        .collect();
+    if !explicit_mods.is_empty() {
+        for (label, flags) in [
+            ("preferred(RENDERING)", BufferObjectFlags::RENDERING),
+            (
+                "preferred(RENDERING|WRITE)",
+                BufferObjectFlags::RENDERING | BufferObjectFlags::WRITE,
+            ),
+        ] {
+            match device.create_buffer_object_with_modifiers2::<()>(
+                width,
+                height,
+                Format::Xrgb8888,
+                explicit_mods.iter().copied(),
+                flags,
+            ) {
+                Ok(buffer) => {
+                    tracing::debug!(
+                        flags = label,
+                        modifier = format!("0x{:016X}", u64::from(buffer.modifier())),
+                        "gbm 输出缓冲已按合成器首选 modifier 分配"
+                    );
+                    return Ok(buffer);
+                }
+                Err(error) => {
+                    tracing::debug!(flags = label, %error, "按首选 modifier 分配失败");
+                }
+            }
+        }
+        match device.create_buffer_object_with_modifiers::<()>(
+            width,
+            height,
+            Format::Xrgb8888,
+            explicit_mods.into_iter(),
+        ) {
+            Ok(buffer) => {
+                tracing::debug!(
+                    modifier = format!("0x{:016X}", u64::from(buffer.modifier())),
+                    "gbm 输出缓冲已按合成器首选 modifier 分配（无 flags）"
+                );
+                return Ok(buffer);
+            }
+            Err(error) => {
+                tracing::debug!(%error, "按首选 modifier 分配失败（无 flags），回退默认梯队");
+            }
+        }
+    }
 
     let ladder: [(&str, BufferObjectFlags); 6] = [
         (
@@ -1697,6 +1759,8 @@ pub struct RgbConverter {
     next_slot: usize,
     renderer: Renderer,
     uv_dialect: UvDialect,
+    is_nvidia_gbm: bool,
+    preferred_modifiers: Vec<u64>,
     /// 输入 NV12 的尺寸（解码器给的**分配**尺寸，按 16 对齐）。
     source_width: u32,
     source_height: u32,
@@ -1774,6 +1838,18 @@ impl RgbConverter {
         output_width: u32,
         output_height: u32,
     ) -> Result<Self, VaapiError> {
+        Self::new_with_output_and_modifiers(node, width, height, output_width, output_height, &[])
+    }
+
+    /// 在 `node` 上建立转换器，按 `output_width`×`output_height` 与合成器首选 `preferred_modifiers` 分配输出槽位。
+    pub fn new_with_output_and_modifiers(
+        node: &Path,
+        width: u32,
+        height: u32,
+        output_width: u32,
+        output_height: u32,
+        preferred_modifiers: &[u64],
+    ) -> Result<Self, VaapiError> {
         if width == 0 || height == 0 {
             return Err(VaapiError::Unsupported(format!(
                 "RGB 转换器尺寸非法: {width}x{height}"
@@ -1801,14 +1877,23 @@ impl RgbConverter {
             gbm::Device::new(file)
                 .map_err(|error| init_error(node, format!("gbm_create_device 失败: {error}")))?,
         );
+        let backend_name = device.backend_name().to_string();
+        let is_nvidia_gbm = backend_name.to_ascii_lowercase().contains("nvidia");
+        let uv_dialect = if is_nvidia_gbm {
+            UvDialect::Rg88
+        } else {
+            UvDialect::PREFERRED
+        };
         tracing::debug!(
             node = %node.display(),
-            backend = %device.backend_name(),
+            backend = %backend_name,
+            is_nvidia_gbm,
+            preferred_modifiers = preferred_modifiers.len(),
             "gbm 设备已建立"
         );
         let renderer = Renderer::new(node, gbm_device_ptr(device.as_ref()), out_w, out_h)?;
         renderer.acquire()?;
-        let built = Self::build_slots(&renderer, &device, node, out_w, out_h);
+        let built = Self::build_slots(&renderer, &device, node, out_w, out_h, preferred_modifiers);
         renderer.release();
         let slots = built?;
         if let Some(first) = slots.first() {
@@ -1826,7 +1911,9 @@ impl RgbConverter {
             slots,
             next_slot: 0,
             renderer,
-            uv_dialect: UvDialect::PREFERRED,
+            uv_dialect,
+            is_nvidia_gbm,
+            preferred_modifiers: preferred_modifiers.to_vec(),
             source_width: width,
             source_height: height,
             visible_width: width,
@@ -1843,6 +1930,11 @@ impl RgbConverter {
             stats: ConvertStats::new(),
             _device: device,
         })
+    }
+
+    /// 绑定外部共享的 `inflight` 计数器（用于预读线程懒建转换器前与生产者共享占用数）。
+    pub fn set_inflight_counter(&mut self, counter: Arc<AtomicUsize>) {
+        self.inflight_total = counter;
     }
 
     /// 输入帧的**分配**尺寸（`source_width` × `source_height`）。
@@ -1903,17 +1995,19 @@ impl RgbConverter {
         node: &Path,
         width: u32,
         height: u32,
+        preferred_modifiers: &[u64],
     ) -> Result<Vec<Slot>, VaapiError> {
         let count = Self::slot_count();
         let mut slots = Vec::with_capacity(count);
         for index in 0..count {
-            let buffer = match allocate_output(device.as_ref(), node, width, height) {
-                Ok(buffer) => buffer,
-                Err(error) => {
-                    Self::destroy_slots(renderer, &slots);
-                    return Err(error);
-                }
-            };
+            let buffer =
+                match allocate_output(device.as_ref(), node, width, height, preferred_modifiers) {
+                    Ok(buffer) => buffer,
+                    Err(error) => {
+                        Self::destroy_slots(renderer, &slots);
+                        return Err(error);
+                    }
+                };
             let fd = match buffer.fd() {
                 Ok(fd) => fd,
                 Err(error) => {
@@ -1933,11 +2027,24 @@ impl RgbConverter {
                 fd: fd.as_raw_fd(),
                 offset,
                 pitch: stride,
-                modifier: (modifier != 0).then_some(modifier),
+                modifier: (modifier != DRM_FORMAT_MOD_INVALID).then_some(modifier),
             };
-            // 输出侧不重试隐式修饰符：拿到的 modifier 必须原样交给合成器。
+            // LINEAR(0) 在个别驱动上需要不带 modifier 属性的隐式导入兜底；其它明确 modifier 原样传。
             let image = match renderer.create_image_once(&plane) {
                 Ok(image) => image,
+                Err(first_err) if modifier == 0 => {
+                    let implicit = PlaneDesc {
+                        modifier: None,
+                        ..plane
+                    };
+                    match renderer.create_image_once(&implicit) {
+                        Ok(image) => image,
+                        Err(_) => {
+                            Self::destroy_slots(renderer, &slots);
+                            return Err(first_err);
+                        }
+                    }
+                }
                 Err(error) => {
                     Self::destroy_slots(renderer, &slots);
                     return Err(error);
@@ -1980,6 +2087,7 @@ impl RgbConverter {
             return;
         }
         if width == self.output_width && height == self.output_height {
+            self.pending_output = None;
             return;
         }
         tracing::info!(
@@ -2025,7 +2133,14 @@ impl RgbConverter {
     fn rebuild_output(&mut self, width: u32, height: u32) -> Result<(), VaapiError> {
         self.renderer.set_target_size(width, height);
         self.renderer.acquire()?;
-        let built = Self::build_slots(&self.renderer, &self._device, &self.node, width, height);
+        let built = Self::build_slots(
+            &self.renderer,
+            &self._device,
+            &self.node,
+            width,
+            height,
+            &self.preferred_modifiers,
+        );
         self.renderer.release();
         let slots = built?;
         // 旧槽位只可能在合成器手里还有 keepalive 引用；Arc 会把 BO 活到最后一帧
@@ -2037,6 +2152,7 @@ impl RgbConverter {
         }
         drop(replaced);
         self.next_slot = 0;
+        self.last_painted = None;
         self.output_width = width;
         self.output_height = height;
         Ok(())
@@ -2118,7 +2234,7 @@ impl RgbConverter {
     ) -> Result<StageTimings, VaapiError> {
         let image_started = Instant::now();
         let planes = nv12_planes(frame)?;
-        let modifier = (frame.modifier != 0).then_some(frame.modifier);
+        let modifier = (frame.modifier != DRM_FORMAT_MOD_INVALID).then_some(frame.modifier);
         let framebuffer = self.slots[slot_index].framebuffer;
 
         let y_image = self.create_image_cached(
@@ -2156,11 +2272,12 @@ impl RgbConverter {
 
         let draw_started = Instant::now();
         let (positions, texcoords) = self.render_geometry();
+        let swap_uv = dialect.swaps_uv(self.is_nvidia_gbm);
         let drawn = self.renderer.draw(DrawArgs {
             framebuffer,
             y_texture,
             uv_texture,
-            uv_swap: dialect.swaps_uv(),
+            uv_swap: swap_uv,
             matrix: OUTPUT_MATRIX,
             positions: &positions,
             texcoords: &texcoords,
@@ -2180,7 +2297,7 @@ impl RgbConverter {
         if self.uv_dialect != dialect {
             tracing::info!(
                 dialect = dialect.name(),
-                swap_uv = dialect.swaps_uv(),
+                swap_uv,
                 "UV 平面改用另一种 fourcc 方言导入"
             );
             self.uv_dialect = dialect;
@@ -2226,7 +2343,8 @@ impl RgbConverter {
             pitch: planes.uv_pitch,
             modifier,
         };
-        match self.create_image_cached(&plane(preferred), preferred.swaps_uv()) {
+        let is_nvidia = self.is_nvidia_gbm;
+        match self.create_image_cached(&plane(preferred), preferred.swaps_uv(is_nvidia)) {
             Ok(image) => Ok((image, preferred)),
             Err(first) => {
                 let fallback = preferred.fallback();
@@ -2236,7 +2354,8 @@ impl RgbConverter {
                     error = %first,
                     "UV 平面按首选 fourcc 导入失败，回退另一种方言"
                 );
-                let image = self.create_image_cached(&plane(fallback), fallback.swaps_uv())?;
+                let image =
+                    self.create_image_cached(&plane(fallback), fallback.swaps_uv(is_nvidia))?;
                 Ok((image, fallback))
             }
         }
@@ -2557,7 +2676,7 @@ mod tests {
     fn uv_dialects_are_mirror_images() {
         assert_eq!(UvDialect::Rg88.fallback(), UvDialect::Gr88);
         assert_eq!(UvDialect::Gr88.fallback(), UvDialect::Rg88);
-        assert_eq!(UvDialect::PREFERRED, UvDialect::Rg88);
+        assert_eq!(UvDialect::PREFERRED, UvDialect::Gr88);
         assert_eq!(UvDialect::Rg88.name(), "RG88");
         assert_eq!(UvDialect::Gr88.name(), "GR88");
     }
@@ -2566,11 +2685,13 @@ mod tests {
     fn uv_dialects_map_to_expected_fourcc_and_swap() {
         assert_eq!(UvDialect::Rg88.fourcc(), DRM_FORMAT_RG88);
         assert_eq!(UvDialect::Rg88.fourcc(), 0x3838_4752);
-        assert!(!UvDialect::Rg88.swaps_uv());
+        // NVIDIA 专有 EGL 对 RG88 不交换；标准 DRM 驱动下 RG88 需交换、GR88 永不交换。
+        assert!(!UvDialect::Rg88.swaps_uv(true));
+        assert!(UvDialect::Rg88.swaps_uv(false));
         assert_eq!(UvDialect::Gr88.fourcc(), DRM_FORMAT_GR88);
         assert_eq!(UvDialect::Gr88.fourcc(), 0x3838_5247);
-        // GR88 的 `.rg` 采样是 V,U，必须交换。
-        assert!(UvDialect::Gr88.swaps_uv());
+        assert!(!UvDialect::Gr88.swaps_uv(false));
+        assert!(!UvDialect::Gr88.swaps_uv(true));
     }
 
     #[test]
@@ -2622,8 +2743,8 @@ mod tests {
     }
 
     #[test]
-    fn plane_attributes_omit_zero_modifier() {
-        let plane = PlaneDesc {
+    fn plane_attributes_include_linear_and_omit_invalid_modifier() {
+        let linear_plane = PlaneDesc {
             label: "输出",
             width: 2560,
             height: 1600,
@@ -2633,11 +2754,21 @@ mod tests {
             pitch: 10240,
             modifier: Some(0),
         };
-        let mut attributes = Vec::new();
-        push_plane_attributes(&mut attributes, &plane);
-        assert!(!attributes.contains(&EGL_PLANE0_MODIFIER_LO));
-        assert!(!attributes.contains(&EGL_PLANE0_MODIFIER_HI));
-        assert_eq!(attributes.last(), Some(&EGL_NONE_I32));
+        let mut linear_attrs = Vec::new();
+        push_plane_attributes(&mut linear_attrs, &linear_plane);
+        assert!(linear_attrs.contains(&EGL_PLANE0_MODIFIER_LO));
+        assert!(linear_attrs.contains(&EGL_PLANE0_MODIFIER_HI));
+        assert_eq!(linear_attrs.last(), Some(&EGL_NONE_I32));
+
+        let invalid_plane = PlaneDesc {
+            modifier: Some(DRM_FORMAT_MOD_INVALID),
+            ..linear_plane
+        };
+        let mut invalid_attrs = Vec::new();
+        push_plane_attributes(&mut invalid_attrs, &invalid_plane);
+        assert!(!invalid_attrs.contains(&EGL_PLANE0_MODIFIER_LO));
+        assert!(!invalid_attrs.contains(&EGL_PLANE0_MODIFIER_HI));
+        assert_eq!(invalid_attrs.last(), Some(&EGL_NONE_I32));
     }
 
     #[test]

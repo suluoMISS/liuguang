@@ -353,7 +353,7 @@ impl VaapiDecoder {
         if parameters.is_null() {
             return Err(VaapiError::Unsupported("视频流没有编码参数".into()));
         }
-        if time_base.den <= 0 {
+        if time_base.num <= 0 || time_base.den <= 0 {
             return Err(VaapiError::Unsupported(format!(
                 "流时基非法：{}/{}",
                 time_base.num, time_base.den
@@ -531,7 +531,12 @@ impl VaapiDecoder {
                 }
                 let owned = std::mem::replace(&mut self.scratch, fresh);
                 let pts = if raw_pts > 0 {
-                    Duration::from_secs_f64(raw_pts as f64 * self.time_base)
+                    let secs = raw_pts as f64 * self.time_base;
+                    if (0.0..1e12).contains(&secs) {
+                        Duration::from_secs_f64(secs)
+                    } else {
+                        Duration::ZERO
+                    }
                 } else {
                     Duration::ZERO
                 };

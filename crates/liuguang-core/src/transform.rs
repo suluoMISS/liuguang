@@ -81,6 +81,9 @@ pub fn rotate_frame(src: &CpuFrame, rotation: Rotation) -> Result<CpuFrame, Fram
     if rotation == Rotation::Deg0 {
         return Ok(src.clone());
     }
+    if src.format.is_semi_planar() {
+        return Err(FrameError::UnsupportedFormat(src.format));
+    }
     let bpp = src.format.bytes_per_pixel() as usize;
     let sw = src.width as usize;
     let sh = src.height as usize;
@@ -155,6 +158,9 @@ pub fn scale_brightness(src: &CpuFrame, brightness: f64) -> Result<CpuFrame, Fra
     src.validate()?;
     if (brightness - 1.0).abs() < 1e-4 {
         return Ok(src.clone());
+    }
+    if src.format.is_semi_planar() {
+        return Err(FrameError::UnsupportedFormat(src.format));
     }
     let factor = brightness.clamp(MIN_BRIGHTNESS, MAX_BRIGHTNESS);
     let mut lut = [0u8; 256];
@@ -424,5 +430,24 @@ mod tests {
         xrgb.format = PixelFormat::Xrgb8888;
         let dim_x = scale_brightness(&xrgb, 0.25).unwrap();
         assert_eq!(&dim_x.data[0..4], &[20, 30, 50, 0]);
+    }
+
+    #[test]
+    fn nv12_is_rejected_by_rotate_and_brightness() {
+        let nv12 = CpuFrame {
+            width: 4,
+            height: 2,
+            stride: 4,
+            format: PixelFormat::Nv12,
+            data: Arc::from(vec![0u8; 4 * 2 * 3 / 2]),
+        };
+        assert!(matches!(
+            rotate_frame(&nv12, Rotation::Deg90),
+            Err(FrameError::UnsupportedFormat(PixelFormat::Nv12))
+        ));
+        assert!(matches!(
+            scale_brightness(&nv12, 0.5),
+            Err(FrameError::UnsupportedFormat(PixelFormat::Nv12))
+        ));
     }
 }
