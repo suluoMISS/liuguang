@@ -332,26 +332,17 @@ fn run(cli: Cli) -> Result<(), String> {
     }
 }
 
-/// 解析桌面模式默认媒体目录（优先 `$XDG_PICTURES_DIR/Wallpapers`，回退 `$HOME/Pictures/Wallpapers`）。
+/// 解析桌面模式默认媒体目录（遵循 `user-dirs.dirs` 中本地化的图片目录，后加 `Wallpapers`）。
 fn default_user_wallpapers_dir() -> Option<PathBuf> {
-    if let Some(pics) = std::env::var_os("XDG_PICTURES_DIR") {
-        let p = PathBuf::from(&pics);
-        if p.is_absolute() {
-            return Some(p.join("Wallpapers"));
-        }
-    }
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(|h| PathBuf::from(h).join("Pictures").join("Wallpapers"))
+    liuguang_core::persona::default_pictures_dir().map(|pics| pics.join("Wallpapers"))
 }
 
 /// 解析桌面模式候选现有目录（用于 `ProtectHome=read-only` 下无法新建目录时的回退）。
 fn fallback_existing_user_dir() -> Option<PathBuf> {
-    if let Some(pics) = std::env::var_os("XDG_PICTURES_DIR") {
-        let p = PathBuf::from(&pics);
-        if p.is_absolute() && p.is_dir() {
-            return Some(p);
-        }
+    if let Some(pics) = liuguang_core::persona::default_pictures_dir()
+        && pics.is_dir()
+    {
+        return Some(pics);
     }
     let home = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())

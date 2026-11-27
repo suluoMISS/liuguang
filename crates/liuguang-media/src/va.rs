@@ -125,11 +125,13 @@ fn set_libva_driver(name: &str) {
     unsafe { std::env::set_var("LIBVA_DRIVER_NAME", name) };
 }
 
-/// VA 驱动 `.so` 可能安装的目录（Fedora/RPM Fusion 与 Debian 布局）。
-const DRIVER_DIRS: [&str; 4] = [
+/// VA 驱动 `.so` 可能安装的目录（Fedora/RPM Fusion、Arch、Debian/Ubuntu x86_64/aarch64）。
+const DRIVER_DIRS: [&str; 6] = [
+    "/usr/lib/dri",
     "/usr/lib64/dri",
     "/usr/lib64/dri-nonfree",
     "/usr/lib/x86_64-linux-gnu/dri",
+    "/usr/lib/aarch64-linux-gnu/dri",
     "/usr/lib32/dri",
 ];
 

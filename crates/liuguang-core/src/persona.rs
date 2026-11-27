@@ -245,6 +245,71 @@ fn fallback_cache() -> PathBuf {
     PathBuf::from(".cache")
 }
 
+/// 从 `user-dirs.dirs` 内容中提取指定键（如 `XDG_PICTURES_DIR="$HOME/图片"`）对应的路径。
+#[must_use]
+pub fn parse_xdg_user_dir(contents: &str, key: &str, home: &std::path::Path) -> Option<PathBuf> {
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((lhs, rhs)) = line.split_once('=') else {
+            continue;
+        };
+        if lhs.trim() != key {
+            continue;
+        }
+        let mut val = rhs.trim();
+        if (val.starts_with('"') && val.ends_with('"') && val.len() >= 2)
+            || (val.starts_with('\'') && val.ends_with('\'') && val.len() >= 2)
+        {
+            val = &val[1..val.len() - 1];
+        }
+        let resolved = if let Some(rest) = val.strip_prefix("$HOME/") {
+            home.join(rest)
+        } else if val == "$HOME" {
+            home.to_path_buf()
+        } else {
+            PathBuf::from(val)
+        };
+        if resolved.is_absolute() {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+/// 解析桌面用户的「图片」目录（优先 `$XDG_PICTURES_DIR`、其次 `~/.config/user-dirs.dirs`，最后按现存 `~/Pictures` / `~/图片` 兜底）。
+#[must_use]
+pub fn default_pictures_dir() -> Option<PathBuf> {
+    if let Some(pics) = std::env::var_os("XDG_PICTURES_DIR") {
+        let p = PathBuf::from(&pics);
+        if p.is_absolute() {
+            return Some(p);
+        }
+    }
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)?;
+    let cfg_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let user_dirs = cfg_dir.join("user-dirs.dirs");
+    if let Ok(contents) = std::fs::read_to_string(&user_dirs)
+        && let Some(pics) = parse_xdg_user_dir(&contents, "XDG_PICTURES_DIR", &home)
+    {
+        return Some(pics);
+    }
+    for rel in ["Pictures", "图片"] {
+        let candidate = home.join(rel);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    Some(home.join("Pictures"))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -405,5 +470,25 @@ mod tests {
             p.socket_path_with(&env),
             PathBuf::from("/home/u/.local/state/liuguang/control.sock")
         );
+    }
+
+    #[test]
+    fn parses_localized_xdg_user_dirs() {
+        let home = PathBuf::from("/home/alice");
+        let text = r#"
+# Commented out: XDG_PICTURES_DIR="$HOME/Ignored"
+XDG_DOWNLOAD_DIR="$HOME/下载"
+XDG_PICTURES_DIR="$HOME/图片"
+XDG_VIDEOS_DIR="/mnt/media/Videos"
+"#;
+        assert_eq!(
+            parse_xdg_user_dir(text, "XDG_PICTURES_DIR", &home),
+            Some(PathBuf::from("/home/alice/图片"))
+        );
+        assert_eq!(
+            parse_xdg_user_dir(text, "XDG_VIDEOS_DIR", &home),
+            Some(PathBuf::from("/mnt/media/Videos"))
+        );
+        assert_eq!(parse_xdg_user_dir(text, "XDG_MUSIC_DIR", &home), None);
     }
 }

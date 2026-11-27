@@ -117,11 +117,7 @@ impl WaylandBackend {
     /// - 无 `WAYLAND_DISPLAY` / 合成器不可达 → [`DisplayError::DeviceUnavailable`]；
     /// - 合成器缺 `zwlr_layer_shell_v1` → [`DisplayError::DeviceUnavailable`]。
     pub fn connect() -> Result<Self, DisplayError> {
-        let conn = Connection::connect_to_env().map_err(|e| {
-            DisplayError::DeviceUnavailable(format!(
-                "无法连接 Wayland 合成器（WAYLAND_DISPLAY 未设置或合成器不可达）: {e}"
-            ))
-        })?;
+        let conn = connect_wayland_with_fallback()?;
         let (globals, queue) = registry_queue_init::<WlState>(&conn).map_err(|e| {
             DisplayError::DeviceUnavailable(format!("Wayland 初始 registry 握手失败: {e}"))
         })?;
@@ -1413,6 +1409,61 @@ where
     }
 }
 
+/// 优先按环境变量连接 Wayland；若 `WAYLAND_DISPLAY` 未设置，自动在 `$XDG_RUNTIME_DIR`
+/// 扫描 `wayland-<数字>` socket 兜底连接（解决桌面会话先起、systemd --user 未继承环境的问题）。
+fn connect_wayland_with_fallback() -> Result<Connection, DisplayError> {
+    match Connection::connect_to_env() {
+        Ok(conn) => Ok(conn),
+        Err(env_err) => {
+            let explicit_empty = std::env::var_os("WAYLAND_DISPLAY").is_none_or(|v| v.is_empty());
+            if explicit_empty
+                && let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR")
+                    .map(std::path::PathBuf::from)
+                    .filter(|p| p.is_absolute())
+            {
+                for sock in discover_wayland_sockets_in(&runtime_dir) {
+                    if let Ok(stream) = std::os::unix::net::UnixStream::connect(&sock)
+                        && let Ok(conn) = Connection::from_socket(stream)
+                    {
+                        tracing::info!(
+                            socket = %sock.display(),
+                            "WAYLAND_DISPLAY 未设置，已自动从 XDG_RUNTIME_DIR 发现并连接 Wayland 合成器"
+                        );
+                        return Ok(conn);
+                    }
+                }
+            }
+            Err(DisplayError::DeviceUnavailable(format!(
+                "无法连接 Wayland 合成器（WAYLAND_DISPLAY 未设置或合成器不可达）: {env_err}"
+            )))
+        }
+    }
+}
+
+fn discover_wayland_sockets_in(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut numbered: Vec<(u32, std::path::PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Some(num_str) = name_str.strip_prefix("wayland-") else {
+            continue;
+        };
+        if num_str.is_empty() || !num_str.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(num) = num_str.parse::<u32>() {
+            numbered.push((num, entry.path()));
+        }
+    }
+    numbered.sort_by_key(|(num, _)| *num);
+    numbered.into_iter().map(|(_, path)| path).collect()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1602,5 +1653,28 @@ mod tests {
         let (src, dst) = normalize_rects(&f, (0, 0, 0, 0), (0, 0, 0, 0));
         assert_eq!(src, (0, 0, 0, 0));
         let _ = dst;
+    }
+
+    #[test]
+    fn discovers_and_orders_wayland_sockets_skipping_locks() {
+        let dir = std::env::temp_dir().join(format!("liuguang-wl-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "wayland-10",
+            "wayland-1",
+            "wayland-0",
+            "wayland-0.lock",
+            "wayland-foo",
+            "other-socket",
+        ] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let found: Vec<String> = discover_wayland_sockets_in(&dir)
+            .into_iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(found, vec!["wayland-0", "wayland-1", "wayland-10"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

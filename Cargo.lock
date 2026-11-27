@@ -837,7 +837,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "liuguang"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "clap",
  "gstreamer",
@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "liuguang-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "clap",
  "serde",
@@ -871,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "liuguang-display"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "drm 0.15.0",
  "drm-ffi",
@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "liuguang-ipc"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "nix",
  "serde",
@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "liuguang-media"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "gstreamer",
  "gstreamer-allocators",
@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "liuguang-render"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "gbm",
  "khronos-egl",
@@ -917,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "liuguang-tui"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "crossterm",
  "liuguang-ipc",
@@ -930,7 +930,7 @@ dependencies = [
 
 [[package]]
 name = "liuguang-vaapi"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "gbm",
  "khronos-egl",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "liuguang-wayland"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "libc",
  "liuguang-core",
@@ -956,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "liuguangctl"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "clap",
  "liuguang-core",

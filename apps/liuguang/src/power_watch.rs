@@ -37,6 +37,8 @@ pub enum Action {
 pub struct PowerSupplyEntry {
     /// `type` 文件内容（如 `"Mains"`, `"USB"`, `"Battery"`）。
     pub kind: String,
+    /// `scope` 文件内容（`System` = 整机供电电池，`Device` = 无线鼠标/键盘/手柄等外设电池）。
+    pub scope: Option<String>,
     /// `online` 文件内容（外接电源节点一般为 `"0"` 或 `"1"`）。
     pub online: Option<String>,
     /// `status` 文件内容（电池节点一般为 `"Charging"`, `"Discharging"`, `"Full"`, `"Not charging"`）。
@@ -53,6 +55,16 @@ pub fn classify_power_entries(entries: &[PowerSupplyEntry]) -> PowerState {
     for entry in entries {
         let kind = entry.kind.trim();
         if kind.eq_ignore_ascii_case("Battery") {
+            // 无线鼠标/键盘/手柄在 Linux power_supply 中也会暴露成 Battery，但 scope="Device"。
+            // 只有整机供电电池（无 scope 或 scope="System"）才参与笔记本电池省电判定。
+            if entry
+                .scope
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| s.eq_ignore_ascii_case("Device"))
+            {
+                continue;
+            }
             has_battery = true;
             if entry
                 .status
@@ -94,10 +106,12 @@ pub fn decide_power_state_in(dir: &Path) -> PowerState {
         let Ok(kind) = std::fs::read_to_string(path.join("type")) else {
             continue;
         };
+        let scope = std::fs::read_to_string(path.join("scope")).ok();
         let online = std::fs::read_to_string(path.join("online")).ok();
         let status = std::fs::read_to_string(path.join("status")).ok();
         entries.push(PowerSupplyEntry {
             kind,
+            scope,
             online,
             status,
         });
@@ -186,9 +200,21 @@ mod tests {
     fn entry(kind: &str, online: Option<&str>, status: Option<&str>) -> PowerSupplyEntry {
         PowerSupplyEntry {
             kind: kind.to_string(),
+            scope: None,
             online: online.map(str::to_string),
             status: status.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn ignores_peripheral_device_batteries_on_desktop() {
+        let mouse = PowerSupplyEntry {
+            kind: "Battery\n".to_string(),
+            scope: Some("Device\n".to_string()),
+            online: None,
+            status: Some("Discharging\n".to_string()),
+        };
+        assert_eq!(classify_power_entries(&[mouse]), PowerState::Ac);
     }
 
     #[test]

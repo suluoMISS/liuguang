@@ -43,18 +43,10 @@ pub fn parse_is_enabled(stdout: &str) -> bool {
     )
 }
 
-/// 解析桌面默认壁纸目录（优先 `$XDG_PICTURES_DIR/Wallpapers`，回退 `$HOME/Pictures/Wallpapers`）。
+/// 解析桌面默认壁纸目录（遵循 `user-dirs.dirs` 中的本地化图片目录）。
 #[must_use]
 pub fn default_wallpapers_dir() -> Option<PathBuf> {
-    if let Some(pics) = std::env::var_os("XDG_PICTURES_DIR") {
-        let p = PathBuf::from(&pics);
-        if p.is_absolute() {
-            return Some(p.join("Wallpapers"));
-        }
-    }
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(|h| PathBuf::from(h).join("Pictures").join("Wallpapers"))
+    liuguang_core::persona::default_pictures_dir().map(|pics| pics.join("Wallpapers"))
 }
 
 /// 生成桌面模式默认 `config.toml` 内容。

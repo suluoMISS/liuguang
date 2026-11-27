@@ -6,7 +6,7 @@
 #   若日后需要调试符号，删掉这行并加 BuildRequires: rust-debugger-common。
 
 Name:           liuguang
-Version:        0.3.1
+Version:        0.3.2
 Release:        1%{?dist}
 Summary:        Dynamic wallpaper engine: Wayland layer (desktop) and DRM/KMS (headless)
 
@@ -163,6 +163,13 @@ fi
 %{_bindir}/liuguangctl
 
 %changelog
+* Fri Nov 27 2026 Liuguang Maintainers <maintainers@liuguang.invalid> - 0.3.2-1
+- power_watch: ignore peripheral Device batteries (mouse/keyboard/headset)
+- wayland: discover wayland-<num> sockets under XDG_RUNTIME_DIR when WAYLAND_DISPLAY is empty
+- daemon: probe VA-API driver before spawning GStreamer warmup thread
+- config/persona/gui: resolve XDG_PICTURES_DIR from ~/.config/user-dirs.dirs for localized locales
+- media/deb: add /usr/lib/dri and aarch64 multiarch DRI paths; recommend gstreamer1.0-plugins-bad
+
 * Fri Nov 27 2026 Liuguang Maintainers <maintainers@liuguang.invalid> - 0.3.1-1
 - feat(gui): add in-app systemd --user service controls (start/stop/restart/enable/init)
   and actionable first-run notice bar

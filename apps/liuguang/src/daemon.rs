@@ -8431,19 +8431,6 @@ pub fn run(opts: DaemonOptions) -> Result<(), String> {
     // 能力而系统里存在具备该能力的驱动，就在这里固化 LIBVA_DRIVER_NAME
     // （不依赖任何手工 export，也不硬编码某个驱动名）。探测结论进日志；
     // 最终实际生效的解码元素在建立视频通道时上报（`status.decoder`）。
-    // **t46**：GStreamer 插件注册表预热（后台线程）。
-    //
-    // 冷启动第一次 set_wallpaper 的 `WALLPAPER_APPLIED` 延迟里，`~1.2s` 是
-    // GStreamer 首次 `init()` 扫插件目录的开销；把它挪到启动后台线程后，
-    // 首个请求只需要建元素（几百毫秒）。**不阻塞主循环**，也不改解码路径。
-    #[cfg(feature = "gstreamer")]
-    std::thread::Builder::new()
-        .name("liuguang-gst-warmup".to_string())
-        .spawn(|| {
-            let _ = gstreamer::init();
-            let _ = gstreamer::Registry::get();
-        })
-        .ok();
     let va = liuguang_media::va::probe();
     let va_applied = liuguang_media::va::apply_recommended_driver(va);
     if va.h264_hardware_available() {
@@ -8460,6 +8447,17 @@ pub fn run(opts: DaemonOptions) -> Result<(), String> {
             "VA-API 硬解能力不可用：视频只能软解（CPU 开销大）"
         );
     }
+
+    // **t46**：GStreamer 插件注册表预热（后台线程），放在 LIBVA_DRIVER_NAME 固化之后启动，
+    // 既避免与 `set_var` 产生多线程竞态，也让 GStreamer 注册表看到正确的 VA 驱动环境。
+    #[cfg(feature = "gstreamer")]
+    std::thread::Builder::new()
+        .name("liuguang-gst-warmup".to_string())
+        .spawn(|| {
+            let _ = gstreamer::init();
+            let _ = gstreamer::Registry::get();
+        })
+        .ok();
 
     let config = if opts.config_path.exists() {
         let mut cfg = Config::load(&opts.config_path)
