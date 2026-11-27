@@ -170,3 +170,25 @@ liuguang-gui                                    # 打开 GTK4 图形界面
 本项目基于 **MIT License (`MIT`)** 协议开源，详见 [LICENSE](LICENSE)。
 
 仓库主页：<https://github.com/suluoMISS/liuguang>
+
+---
+
+## Nix / NixOS
+
+```bash
+nix run github:suluoMISS/liuguang#liuguang-gui      # 直接运行 GUI
+nix profile add github:suluoMISS/liuguang#liuguang github:suluoMISS/liuguang#liuguang-gui
+```
+
+NixOS（flake）：
+
+```nix
+inputs.liuguang.url = "github:suluoMISS/liuguang";
+# modules = [ inputs.liuguang.nixosModules.default ];
+services.liuguang = {
+  enable = true;
+  persona = "user";   # 桌面 Wayland 壁纸层；无头 DRM/KMS 用 "system"
+};
+```
+
+也可用 `overlays.default` 获得 `pkgs.liuguang` / `pkgs.liuguang-gui`；`nix develop` 进入开发环境。
