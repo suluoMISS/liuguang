@@ -86,10 +86,10 @@ fn read_cpu_ticks() -> Option<u64> {
     Some(utime + stime)
 }
 
-/// 读当前进程常驻内存（`/proc/self/statm` 第 2 字段 × 页大小，字节）。
-pub(crate) fn read_mem_bytes() -> u64 {
+/// 读常驻内存（`/proc/self/statm` 第 2 字段 × 页大小）与线程数（`/proc/self/status`）。
+fn read_mem_and_threads() -> (u64, u32) {
     let page = 4096_u64; // x86_64 默认页大小；statm 单位为页。
-    std::fs::read_to_string("/proc/self/statm")
+    let rss = std::fs::read_to_string("/proc/self/statm")
         .ok()
         .and_then(|t| {
             t.split_whitespace()
@@ -97,12 +97,7 @@ pub(crate) fn read_mem_bytes() -> u64 {
                 .and_then(|v| v.parse::<u64>().ok())
         })
         .map(|pages| pages.saturating_mul(page))
-        .unwrap_or(0)
-}
-
-/// 读常驻内存与线程数（`/proc/self/status`）。
-fn read_mem_and_threads() -> (u64, u32) {
-    let rss = read_mem_bytes();
+        .unwrap_or(0);
     let threads = std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|t| {

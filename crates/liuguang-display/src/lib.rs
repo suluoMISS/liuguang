@@ -468,9 +468,6 @@ pub trait DisplayBackend {
     fn compositor_name(&self) -> Option<String> {
         None
     }
-
-    /// 尝试回收已释放且不再展示的共享内存后备页（默认无操作）。
-    fn reclaim_idle_buffers(&mut self) {}
 }
 
 #[cfg(test)]

@@ -449,19 +449,9 @@ impl VaapiDecoder {
             write_hw_device_ctx(self.codec, codec_ref);
         }
         let stage = std::time::Instant::now();
-        // VA-API 在 GPU 侧解码，FFmpeg 默认 threads=0 会按 CPU 核数（如 16 核）派生多线程
-        // 帧解码上下文与独立缓冲区，导致解码器打开期间堆内存和匿名页激增数十 MiB。
-        // 显式传 threads=1 只保留单线程调度即可跑满 4K60 硬件解码。
-        let mut codec_opts: *mut ffi::AvDictionary = std::ptr::null_mut();
-        if let (Ok(key), Ok(value)) = (CString::new("threads"), CString::new("1")) {
-            // SAFETY: key 与 value 均以 NUL 结尾；codec_opts 由 ffmpeg 分配/持有。
-            unsafe { av_dict_set(&raw mut codec_opts, key.as_ptr(), value.as_ptr(), 0) };
-        }
-        // SAFETY: codec 有效且已配置；codec_opts 由 avcodec_open2 消费并在下方释放。
+        // SAFETY: codec 有效且已配置。
         let opened =
-            unsafe { ffi::avcodec_open2(self.codec, std::ptr::null(), &raw mut codec_opts) };
-        // SAFETY: 释放 avcodec_open2 后剩余的未识别键字典，空指针安全。
-        unsafe { av_dict_free(&raw mut codec_opts) };
+            unsafe { ffi::avcodec_open2(self.codec, std::ptr::null(), std::ptr::null_mut()) };
         profile_stage("avcodec_open2", stage.elapsed());
         if opened < 0 {
             return Err(VaapiError::Ffmpeg(format!(

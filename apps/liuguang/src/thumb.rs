@@ -40,9 +40,6 @@ use liuguang_media::thumbnail::Thumbnail;
 /// 解码失败、seek 失败、超时、文件不可读时返回人类可读的原因。
 pub fn extract_at(path: &Path, max_w: u32, max_h: u32, at_ms: u64) -> Result<Thumbnail, String> {
     if at_ms == 0 || is_image(path) {
-        if let Some(thumb) = decode_png_direct(path, max_w, max_h)? {
-            return Ok(thumb);
-        }
         return liuguang_media::thumbnail::extract(path, max_w, max_h).map_err(|e| e.to_string());
     }
     imp::extract_seek(path, max_w, max_h, at_ms)
@@ -68,49 +65,8 @@ const PREROLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 抽帧后最多按 `MAX_SAMPLE_DIM` 抽样（与 `liuguang-media` 保守一致）。
+#[cfg(feature = "gstreamer")]
 const MAX_SAMPLE_DIM: u32 = 1024;
-
-/// 内部缩略图子进程参数：将 GStreamer / FFmpeg / libLLVM 隔离到按需启停的短命子进程中。
-pub const INTERNAL_THUMB_WORKER_ARG: &str = "--internal-thumb-worker";
-
-/// 缩略图子进程空闲超时后自动退出，归还全部 GStreamer 插件与匿名页。
-const CHILD_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// 单次缩略图子进程请求的读超时上限（覆盖 GStreamer 预滚/seek/拉帧，防止卡死永久阻塞 worker）。
-const CHILD_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// 若输入确认为 PNG 文件（匹配 IHDR 签名），使用纯 Rust 流式降采样解码，绕开 GStreamer。
-fn decode_png_direct(path: &Path, max_w: u32, max_h: u32) -> Result<Option<Thumbnail>, String> {
-    use std::io::Read as _;
-    const SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-    if max_w == 0 || max_h == 0 {
-        return Err("缩略图尺寸不能为 0".to_string());
-    }
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
-    let mut head = [0u8; 8];
-    let n = file
-        .read(&mut head)
-        .map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
-    if n < SIG.len() || head != SIG {
-        return Ok(None);
-    }
-    drop(file);
-    let cap_w = max_w.min(MAX_SAMPLE_DIM);
-    let cap_h = max_h.min(MAX_SAMPLE_DIM);
-    let decode_w = cap_w.saturating_mul(2).min(MAX_SAMPLE_DIM);
-    let decode_h = cap_h.saturating_mul(2).min(MAX_SAMPLE_DIM);
-    let cpu = liuguang_media::png_load::load_png_fitted(path, decode_w, decode_h)
-        .map_err(|e| e.to_string())?;
-    let thumb = Thumbnail {
-        width: cpu.width,
-        height: cpu.height,
-        rgba: cpu.data.to_vec(),
-    };
-    Ok(Some(liuguang_media::thumbnail::scale_to_fit(
-        thumb, cap_w, cap_h,
-    )))
-}
 
 #[cfg(feature = "gstreamer")]
 mod imp {
@@ -422,10 +378,11 @@ mod imp {
 // 4. **管线内缩放**：解码时就把画面缩到目标尺寸（[`imp::extract_fitted`]），
 //    不再先转整帧 4K RGBA 再缩，单帧 CPU 降一个数量级。
 
-/// 内存缓存条目上限（磁盘已有缓存，内存只保留少量热条目）。
-const MAX_MEM_ENTRIES: usize = 32;
-/// 内存缓存的总字节上限（已编码 PNG）：磁盘缓存毫秒级可读，收紧内存 LRU 至 4 MiB。
-const MAX_MEM_BYTES: usize = 4 * 1024 * 1024;
+/// 内存缓存条目上限（每条约几十 KB 的已编码 PNG，够 GUI 一屏来回滚）。
+const MAX_MEM_ENTRIES: usize = 48;
+/// 内存缓存的总字节上限（已编码 PNG）：一张 320×200 的封面通常 60–200 KB，
+/// 4K 素材的大图可能到 1–2 MB；只按条数限制时峰值能到 100 MB 以上。
+const MAX_MEM_BYTES: usize = 24 * 1024 * 1024;
 
 /// 排队上限：超过就直接回 `BUSY`。
 ///
@@ -437,30 +394,9 @@ pub const MAX_QUEUE: usize = 32;
 /// 后台解码的占空比目标（单核百分比）：压在 ~15%，给正在播的视频留足余量；
 /// 并发解码线程数（`LIUGUANG_THUMB_WORKERS` 可覆盖，1–8）。
 ///
-/// 磁盘缓存命中不经过工作线程，只有首次建库时才会批量解码；默认单线程即可满足
-/// 队列合并，且可避免多余线程堆与 glibc arena 开销。
-pub const DEFAULT_WORKERS: usize = 1;
-
-/// 启动阶段配置 glibc `mallopt`，限制 arena 数量及 mmap/trim 阈值以抑制常驻匿名页。
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-#[allow(unsafe_code)]
-pub(crate) fn configure_allocator() {
-    const M_TRIM_THRESHOLD: std::ffi::c_int = -1;
-    const M_MMAP_THRESHOLD: std::ffi::c_int = -3;
-    const M_ARENA_MAX: std::ffi::c_int = -8;
-    unsafe extern "C" {
-        fn mallopt(param: std::ffi::c_int, value: std::ffi::c_int) -> std::ffi::c_int;
-    }
-    // SAFETY: glibc `mallopt` 对整型阈值参数安全无副作用；在启动初期单线程阶段调用。
-    unsafe {
-        let _ = mallopt(M_ARENA_MAX, 2);
-        let _ = mallopt(M_MMAP_THRESHOLD, 131_072);
-        let _ = mallopt(M_TRIM_THRESHOLD, 65_536);
-    }
-}
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-pub(crate) fn configure_allocator() {}
+/// 磁盘缓存命中不经过工作线程，只有首次建库时才会批量解码；默认取 2 条线程
+/// 以控制 4K/8K 图片并行解码时的 glibc heap 峰值与常驻线程数。
+pub const DEFAULT_WORKERS: usize = 2;
 
 /// 将已释放的堆顶空闲页归还给操作系统（仅 glibc 环境生效）。
 ///
@@ -809,7 +745,7 @@ fn worker_count() -> usize {
         .map_or(DEFAULT_WORKERS, |n| n.clamp(1, 8))
 }
 
-/// 后台解码线程：共享队列、按需拉起短命 GStreamer 子进程、按占空比节流。
+/// 后台解码线程：共享队列、并发解码、按占空比节流。
 fn worker_loop(
     state: &Arc<Mutex<State>>,
     wake: &Arc<Condvar>,
@@ -817,15 +753,11 @@ fn worker_loop(
     counters: &Arc<Counters>,
     dir: &Path,
 ) {
-    let mut gst_child: Option<ThumbChild> = None;
-    let mut idle_since = Instant::now();
     loop {
         let job = {
             let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if stop.load(Ordering::Relaxed) {
-                    drop(guard);
-                    drop(gst_child.take());
                     return;
                 }
                 if let Some(job) = guard.queue.pop_front() {
@@ -835,16 +767,6 @@ fn worker_loop(
                     break job;
                 }
                 counters.queue_depth.store(0, Ordering::Relaxed);
-                let idle_expired = gst_child.is_some()
-                    && guard.inflight.is_empty()
-                    && idle_since.elapsed() >= CHILD_IDLE_TIMEOUT;
-                if idle_expired {
-                    drop(guard);
-                    drop(gst_child.take());
-                    trim_heap();
-                    guard = state.lock().unwrap_or_else(|e| e.into_inner());
-                    continue;
-                }
                 guard = match wake.wait_timeout(guard, Duration::from_millis(500)) {
                     Ok((guard, _)) => guard,
                     Err(poisoned) => poisoned.into_inner().0,
@@ -852,8 +774,30 @@ fn worker_loop(
             }
         };
         let started = Instant::now();
-        let outcome = decode_and_encode_with_child(&job.request, &mut gst_child);
-        idle_since = Instant::now();
+        let outcome = decode(&job.request).and_then(|mut thumb| {
+            let mut bytes = encode_png(&thumb.rgba, thumb.width, thumb.height)?;
+            for _ in 0..3 {
+                if bytes.len() <= MAX_THUMB_PNG_BYTES || (thumb.width <= 128 && thumb.height <= 128)
+                {
+                    break;
+                }
+                let next_w = (thumb.width * 3 / 4).max(1);
+                let next_h = (thumb.height * 3 / 4).max(1);
+                thumb = liuguang_media::thumbnail::scale_to_fit(thumb, next_w, next_h);
+                bytes = encode_png(&thumb.rgba, thumb.width, thumb.height)?;
+            }
+            if bytes.len() > MAX_THUMB_PNG_BYTES {
+                return Err(format!(
+                    "缩略图编码体积 {}B 超过 IPC 上限 {MAX_THUMB_PNG_BYTES}B",
+                    bytes.len()
+                ));
+            }
+            Ok(Decoded {
+                bytes,
+                width: thumb.width,
+                height: thumb.height,
+            })
+        });
         let elapsed = started.elapsed();
         counters.decoded.fetch_add(1, Ordering::Relaxed);
         counters
@@ -919,281 +863,9 @@ fn worker_loop(
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ChildThumbReq {
-    path: PathBuf,
-    max_w: u32,
-    max_h: u32,
-    at_ms: u64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ChildThumbResp {
-    ok: bool,
-    width: u32,
-    height: u32,
-    png_b64: String,
-    error: String,
-}
-
-struct ThumbChild {
-    stdin: Option<std::io::BufWriter<std::process::ChildStdin>>,
-    stdout_rx: Receiver<std::io::Result<Option<String>>>,
-    child: std::process::Child,
-}
-
-impl ThumbChild {
-    fn spawn() -> Option<Self> {
-        if cfg!(test) {
-            return None;
-        }
-        let exe = std::env::current_exe().ok()?;
-        let mut child = std::process::Command::new(exe)
-            .arg(INTERNAL_THUMB_WORKER_ARG)
-            .env("MALLOC_ARENA_MAX", "1")
-            .env("MALLOC_MMAP_THRESHOLD_", "65536")
-            .env("MALLOC_TRIM_THRESHOLD_", "32768")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok()?;
-        let stdin = std::io::BufWriter::new(child.stdin.take()?);
-        let stdout = child.stdout.take()?;
-        let (tx, stdout_rx) = std::sync::mpsc::channel();
-        if std::thread::Builder::new()
-            .name("liuguang-thumb-child-rx".into())
-            .spawn(move || {
-                use std::io::BufRead as _;
-                let mut reader = std::io::BufReader::new(stdout);
-                loop {
-                    let mut line = String::new();
-                    match reader.read_line(&mut line) {
-                        Ok(0) => {
-                            let _ = tx.send(Ok(None));
-                            break;
-                        }
-                        Ok(_) => {
-                            if tx.send(Ok(Some(line))).is_err() {
-                                break;
-                            }
-                        }
-                        Err(err) => {
-                            let _ = tx.send(Err(err));
-                            break;
-                        }
-                    }
-                }
-            })
-            .is_err()
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        Some(Self {
-            stdin: Some(stdin),
-            stdout_rx,
-            child,
-        })
-    }
-
-    fn request(&mut self, req: &Request) -> Result<Decoded, String> {
-        use std::io::Write as _;
-        let payload = ChildThumbReq {
-            path: req.path.clone(),
-            max_w: req.max_w,
-            max_h: req.max_h,
-            at_ms: req.at_ms,
-        };
-        let Some(stdin) = self.stdin.as_mut() else {
-            return Err("缩略图子进程标准输入已关闭".to_string());
-        };
-        let serialized = serde_json::to_string(&payload)
-            .map_err(|e| format!("序列化缩略图子进程请求失败: {e}"))?;
-        stdin
-            .write_all(serialized.as_bytes())
-            .and_then(|()| stdin.write_all(b"\n"))
-            .and_then(|()| stdin.flush())
-            .map_err(|e| format!("向缩略图子进程写入请求失败: {e}"))?;
-        let line = match self.stdout_rx.recv_timeout(CHILD_REQUEST_TIMEOUT) {
-            Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => return Err("缩略图子进程意外退出".to_string()),
-            Ok(Err(e)) => return Err(format!("读取缩略图子进程响应失败: {e}")),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let _ = self.child.kill();
-                return Err(format!(
-                    "读取缩略图子进程响应超时（>{}s）",
-                    CHILD_REQUEST_TIMEOUT.as_secs()
-                ));
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("缩略图子进程响应通道意外关闭".to_string());
-            }
-        };
-        let resp: ChildThumbResp =
-            serde_json::from_str(&line).map_err(|e| format!("解析缩略图子进程响应失败: {e}"))?;
-        if !resp.ok {
-            return Err(resp.error);
-        }
-        let bytes = liuguang_ipc::base64::decode(&resp.png_b64)
-            .ok_or_else(|| "缩略图子进程返回的 base64 非法".to_string())?;
-        Ok(Decoded {
-            bytes,
-            width: resp.width,
-            height: resp.height,
-        })
-    }
-}
-
-impl Drop for ThumbChild {
-    fn drop(&mut self) {
-        drop(self.stdin.take());
-        let deadline = Instant::now() + Duration::from_millis(500);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                _ => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
-                    return;
-                }
-            }
-        }
-    }
-}
-
-/// 缩略图隔离工作子进程主循环：从 stdin 逐行接收请求并回写已编码 PNG。
-#[must_use]
-pub fn run_internal_worker_main() -> u8 {
-    use std::io::{BufRead as _, Write as _};
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else {
-            break;
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let resp = match serde_json::from_str::<ChildThumbReq>(&line) {
-            Ok(req) => {
-                let r = Request {
-                    path: req.path,
-                    at_ms: req.at_ms,
-                    max_w: req.max_w,
-                    max_h: req.max_h,
-                };
-                match encode_job_in_process(&r) {
-                    Ok(decoded) => ChildThumbResp {
-                        ok: true,
-                        width: decoded.width,
-                        height: decoded.height,
-                        png_b64: liuguang_ipc::base64::encode(&decoded.bytes),
-                        error: String::new(),
-                    },
-                    Err(error) => ChildThumbResp {
-                        ok: false,
-                        width: 0,
-                        height: 0,
-                        png_b64: String::new(),
-                        error,
-                    },
-                }
-            }
-            Err(error) => ChildThumbResp {
-                ok: false,
-                width: 0,
-                height: 0,
-                png_b64: String::new(),
-                error: format!("参数解析失败: {error}"),
-            },
-        };
-        if serde_json::to_writer(&mut out, &resp).is_err()
-            || out.write_all(b"\n").is_err()
-            || out.flush().is_err()
-        {
-            break;
-        }
-        trim_heap();
-    }
-    0
-}
-
-fn decode_and_encode_with_child(
-    request: &Request,
-    gst_child: &mut Option<ThumbChild>,
-) -> Result<Decoded, String> {
-    if is_image(&request.path)
-        && let Some(thumb) = decode_png_direct(&request.path, request.max_w, request.max_h)?
-    {
-        return encode_thumbnail_bounded(thumb);
-    }
-    if !cfg!(test) {
-        for attempt in 0..2 {
-            if gst_child.is_none() {
-                *gst_child = ThumbChild::spawn();
-            }
-            let Some(child) = gst_child.as_mut() else {
-                break;
-            };
-            match child.request(request) {
-                Ok(decoded) => return Ok(decoded),
-                Err(error) => {
-                    let pipe_broken = error.contains("子进程");
-                    if !pipe_broken || attempt == 1 {
-                        if pipe_broken {
-                            *gst_child = None;
-                        }
-                        return Err(error);
-                    }
-                    *gst_child = None;
-                }
-            }
-        }
-    }
-    encode_job_in_process(request)
-}
-
-fn encode_job_in_process(request: &Request) -> Result<Decoded, String> {
-    let thumb = decode(request)?;
-    encode_thumbnail_bounded(thumb)
-}
-
-fn encode_thumbnail_bounded(mut thumb: Thumbnail) -> Result<Decoded, String> {
-    let mut bytes = encode_png(&thumb.rgba, thumb.width, thumb.height)?;
-    for _ in 0..3 {
-        if bytes.len() <= MAX_THUMB_PNG_BYTES || (thumb.width <= 128 && thumb.height <= 128) {
-            break;
-        }
-        let next_w = (thumb.width * 3 / 4).max(1);
-        let next_h = (thumb.height * 3 / 4).max(1);
-        thumb = liuguang_media::thumbnail::scale_to_fit(thumb, next_w, next_h);
-        bytes = encode_png(&thumb.rgba, thumb.width, thumb.height)?;
-    }
-    if bytes.len() > MAX_THUMB_PNG_BYTES {
-        return Err(format!(
-            "缩略图编码体积 {}B 超过 IPC 上限 {MAX_THUMB_PNG_BYTES}B",
-            bytes.len()
-        ));
-    }
-    Ok(Decoded {
-        bytes,
-        width: thumb.width,
-        height: thumb.height,
-    })
-}
-
-/// 取帧 + 按目标尺寸缩放（PNG 走纯 Rust，视频/其余图片走管线内缩放）。
+/// 取帧 + 按目标尺寸缩放（图片走既有实现，视频走管线内缩放）。
 fn decode(request: &Request) -> Result<Thumbnail, String> {
     if is_image(&request.path) {
-        if let Some(thumb) = decode_png_direct(&request.path, request.max_w, request.max_h)? {
-            return Ok(thumb);
-        }
         return liuguang_media::thumbnail::extract(&request.path, request.max_w, request.max_h)
             .map_err(|e| e.to_string());
     }

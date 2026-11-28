@@ -32,8 +32,6 @@ static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 struct Slot {
     buffer: wl_buffer::WlBuffer,
     busy: bool,
-    /// 该槽位自创建或上次 `punch_hole` 后是否写入过像素数据。
-    written: bool,
 }
 
 /// 一个输出专属的共享内存池。不可 `Send`（wayland 代理跨线程语义由
@@ -42,6 +40,7 @@ pub(crate) struct Pool {
     pool_id: u64,
     /// memfd 所有权句柄：仅用于持有（fd 已交给 wl_shm，但映射在
     /// `Drop`（munmap → close）前必须保持文件打开）。
+    #[allow(dead_code)] // 所有权字段，构造后不再读取
     file: OwnedFd,
     ptr: *mut u8,
     len: usize,
@@ -53,8 +52,6 @@ pub(crate) struct Pool {
     format: wl_shm::Format,
     pool: wl_shm_pool::WlShmPool,
     slots: Vec<Slot>,
-    /// 最近一次提交给合成器的槽位，回收时始终保留，避免零化当前画面。
-    last_committed: Option<u32>,
 }
 
 impl std::fmt::Debug for Pool {
@@ -130,7 +127,6 @@ impl Pool {
             slots.push(Slot {
                 buffer,
                 busy: false,
-                written: false,
             });
         }
         Ok(Self {
@@ -144,7 +140,6 @@ impl Pool {
             format,
             pool,
             slots,
-            last_committed: None,
         })
     }
 
@@ -176,8 +171,6 @@ impl Pool {
     pub(crate) fn mark_busy(&mut self, slot: u32) {
         if let Some(s) = self.slots.get_mut(slot as usize) {
             s.busy = true;
-            s.written = true;
-            self.last_committed = Some(slot);
         }
     }
 
@@ -185,19 +178,6 @@ impl Pool {
     pub(crate) fn release_slot(&mut self, slot: u32) {
         if let Some(s) = self.slots.get_mut(slot as usize) {
             s.busy = false;
-        }
-    }
-
-    /// 归还除最近一次提交外所有已释放旧槽位占用的 memfd 物理页（静态壁纸/转场结束后防三槽常驻）。
-    pub(crate) fn reclaim_unused_slots(&mut self) {
-        let fd = self.file.as_raw_fd();
-        for (idx, slot) in self.slots.iter_mut().enumerate() {
-            if !slot.busy && slot.written && Some(idx as u32) != self.last_committed {
-                let start = idx * self.slot_bytes;
-                if sys::punch_hole_range(fd, start, self.slot_bytes).is_ok() {
-                    slot.written = false;
-                }
-            }
         }
     }
 
