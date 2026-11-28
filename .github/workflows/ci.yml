@@ -51,7 +51,8 @@ jobs:
             libavcodec-dev \
             libavutil-dev \
             gstreamer1.0-vaapi \
-            gstreamer1.0-plugins-base
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good
 
       # 阶段 A：默认 feature 构型
       - name: 阶段 A — fmt
