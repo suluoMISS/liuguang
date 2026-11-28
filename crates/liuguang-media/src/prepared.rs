@@ -142,6 +142,22 @@ impl PreloadCache {
         self.frames.clear();
         self.lru.clear();
     }
+
+    /// 仅保留满足 `keep` 的缓存条目，释放不再需要的预解码帧。
+    pub fn retain<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&Path) -> bool,
+    {
+        let drop_keys: Vec<PathBuf> = self
+            .frames
+            .keys()
+            .filter(|p| !keep(p.as_path()))
+            .cloned()
+            .collect();
+        for key in drop_keys {
+            let _ = self.take(&key);
+        }
+    }
 }
 
 #[cfg(test)]

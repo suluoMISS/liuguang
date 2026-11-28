@@ -1435,6 +1435,27 @@ impl DisplayBackend for WaylandBackend {
         let clean = comm.trim().to_ascii_lowercase();
         (!clean.is_empty()).then_some(clean)
     }
+
+    fn reclaim_idle_buffers(&mut self) {
+        let has_pools = self
+            .wl
+            .borrow()
+            .outputs
+            .values()
+            .any(|e| e.pool.is_some() || e.frame_pool.is_some());
+        if !has_pools || self.ensure_alive().is_err() {
+            return;
+        }
+        let mut wl = self.wl.borrow_mut();
+        for entry in wl.outputs.values_mut() {
+            if let Some(pool) = entry.pool.as_mut() {
+                pool.reclaim_unused_slots();
+            }
+            if let Some(frame_pool) = entry.frame_pool.as_mut() {
+                frame_pool.reclaim_unused_slots();
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

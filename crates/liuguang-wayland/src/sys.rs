@@ -172,3 +172,83 @@ pub(crate) fn peer_pid(fd: RawFd) -> Option<u32> {
         None
     }
 }
+
+/// 系统页大小（至少 4096 字节），用于对齐 memfd 打洞区间防止跨槽误清。
+fn page_size() -> usize {
+    static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGE_SIZE.get_or_init(|| {
+        // SAFETY: `sysconf(_SC_PAGESIZE)` 无指针入参、无全局副作用。
+        let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        usize::try_from(raw)
+            .ok()
+            .filter(|&n| n >= 4096 && n.is_power_of_two())
+            .unwrap_or(4096)
+    })
+}
+
+/// 将 memfd 区间 `[offset, offset + len)` 内**严格对齐在边界内侧**的整页归还给内核
+/// （`fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`），保留文件大小与映射地址不变。
+pub(crate) fn punch_hole_range(fd: RawFd, offset: usize, len: usize) -> io::Result<()> {
+    let Some(end) = offset.checked_add(len) else {
+        return Ok(());
+    };
+    let page = page_size();
+    let aligned_start = offset.next_multiple_of(page);
+    let aligned_end = end - (end % page);
+    if aligned_end <= aligned_start {
+        return Ok(());
+    }
+    let aligned_len = aligned_end - aligned_start;
+    // SAFETY: `fd` 为调用方 `Pool` 持有的有效 memfd；`aligned_start..aligned_end` 严格落在该槽位内部，
+    // 绝不会越界清零相邻槽位像素。
+    let rc = unsafe {
+        libc::fallocate(
+            fd,
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            aligned_start as libc::off_t,
+            aligned_len as libc::off_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn punch_hole_range_only_clears_target_slot_even_when_unaligned() {
+        let slot_bytes = 5464; // 1366x1x4，刻意非 4096 页对齐
+        let total = slot_bytes * 3;
+        let fd = memfd_owned(b"liuguang-hole-test\0").unwrap();
+        ftruncate(fd.as_raw_fd(), total).unwrap();
+        let ptr = mmap_shared_rw(fd.as_raw_fd(), total).unwrap();
+        // SAFETY: `ptr..ptr+total` 独占映射，测试结束后 munmap。
+        unsafe {
+            let buf = slice_mut(ptr, total);
+            buf.fill(0xAA);
+            punch_hole_range(fd.as_raw_fd(), slot_bytes, slot_bytes).unwrap();
+            assert!(
+                buf[..slot_bytes].iter().all(|&b| b == 0xAA),
+                "槽 0 边界不得被邻槽打洞破坏"
+            );
+            assert!(
+                buf[slot_bytes * 2..].iter().all(|&b| b == 0xAA),
+                "槽 2 边界不得被邻槽打洞破坏"
+            );
+            // 中间页对齐部分应已被内核清零。
+            let page = page_size();
+            let mid_start = slot_bytes.next_multiple_of(page);
+            let mid_end = (slot_bytes * 2) - ((slot_bytes * 2) % page);
+            if mid_end > mid_start {
+                assert!(buf[mid_start..mid_end].iter().all(|&b| b == 0));
+            }
+            munmap(ptr, total);
+        }
+    }
+}

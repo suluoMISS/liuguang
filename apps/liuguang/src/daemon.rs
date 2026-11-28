@@ -197,13 +197,17 @@ fn vaapi_setting_enabled_in(config: &Config) -> bool {
 fn startup_consumer(
     config: &Config,
     backend: &dyn DisplayBackend,
-    caps: &crate::compat::HardwareCaps,
 ) -> crate::compat::DecodeConsumer {
+    let probed = if cfg!(feature = "vaapi") {
+        crate::compat::DecodeConsumer::Vaapi
+    } else {
+        crate::compat::DecodeConsumer::GStreamer
+    };
     crate::compat::DecodeConsumer::for_playback(
         cfg!(feature = "vaapi"),
         vaapi_setting_enabled_in(config),
         backend.supports_dmabuf_scanout(),
-        caps.consumer,
+        probed,
     )
 }
 
@@ -271,6 +275,12 @@ fn producer_kind(
 fn preload_budget_bytes(config: &Config) -> usize {
     (config.performance.max_cache_mb as usize).saturating_mul(1024 * 1024)
 }
+
+/// 轮换预解码的提前窗口（只在即将切图前 15 秒才提前解下一张，避免长间隔期间白占 ~32 MiB）。
+const PRELOAD_LEAD_TIME: Duration = Duration::from_secs(15);
+
+/// 预解码内存软水位：当 `RSS + 预估解码帧 > 116 MiB` 时跳过预解码（切图时再同步解码）。
+const PRELOAD_RSS_SOFT_LIMIT_BYTES: u64 = 116 * 1024 * 1024;
 
 /// "文件还是不是预加载时那一份"的凭据。
 ///
@@ -432,10 +442,10 @@ impl TransitionSettings {
     }
 }
 
-/// 当前显示内容（保留渲染帧供转场/断线恢复）。
+/// 当前显示内容（静态图不常驻 4K 像素副本，转场或重建时按需重渲染）。
 struct CurrentDisplay {
     media: PathBuf,
-    frame: CpuFrame,
+    frame: Option<CpuFrame>,
     mode_str: String,
     decoder: String,
 }
@@ -617,6 +627,8 @@ struct ChannelState {
     /// 而"这条通道接下来会播哪张"是通道状态 —— 通道随拔除一起消失时，
     /// 未完成的预加载意图也自然作废（§11.2「拔除 ⇒ 关闭对应输出流与缓存」）。
     preload_target: Option<PathBuf>,
+    /// 本输出通道的图片降采样目标（独立维护，避免多屏互相覆盖分辨率）。
+    preload_dims: (u32, u32),
 }
 
 impl ChannelState {
@@ -894,8 +906,8 @@ pub struct Runtime {
     vaapi_verified_node: Option<(PathBuf, bool)>,
     /// 媒体索引（异步扫描产物）。
     media: MediaIndex,
-    /// 本机解码能力（t15：兼容性分类的输入；构造期探测一次）。
-    caps: crate::compat::HardwareCaps,
+    /// 本机解码能力（懒探测一次并缓存，避免静态图模式启动阶段加载 VA-API/libLLVM）。
+    caps: Mutex<Option<crate::compat::HardwareCaps>>,
     /// 后台转码器（t15：把硬件解不动的素材转成可硬解的缓存）。
     transcode: crate::transcode::Transcoder,
     /// 等转码完成后要自动播的通道（`set_wallpaper` 回 `NEEDS_PREPARATION` 时登记）。
@@ -971,11 +983,6 @@ pub struct Runtime {
     /// 图片预加载缓存（`performance.preload_next` 决定用不用、
     /// `performance.max_cache_mb` 决定字节预算）。
     preload: liuguang_media::prepared::PreloadCache,
-    /// 图片解码的降采样目标（= 最近一次静态图输出的 1.25 倍尺寸）。
-    ///
-    /// 壁纸最终只上屏到输出分辨率；按这个尺寸解码可以把 61 MP PNG 的
-    /// 临时缓冲从 ~244 MB 压到几 MB。预加载也用同一尺寸。
-    preload_dims: (u32, u32),
     /// 每张已预加载图片的"文件凭据"（命中前核对，防止显示已被替换的旧帧）。
     preload_stamps: HashMap<PathBuf, FileStamp>,
     /// 待写回 `config.toml` 的偏好（防抖合并；见 `config_store`）。
@@ -1053,11 +1060,8 @@ impl Runtime {
         let game_extra = config.performance.game_processes.clone();
         let game_ignore = config.performance.game_ignore_processes.clone();
         let power_enabled = config.performance.pause_on_battery;
-        // **t15**：能力探测 + 转码器。都在构造期建好（转码线程按需起）。
-        let caps = crate::compat::HardwareCaps::detect(config.media.transcode_max_width);
-        // t37：转码目标跟着**实际解码路径**走。构造期还没有通道，先取默认输出的
-        // 判定（设置项 + 后端能力 + 设备探测）；每个任务提交时再按输出确认一次。
-        let startup = startup_consumer(&config, backend.as_ref(), &caps);
+        // **t15**：按需懒探测硬件能力；构造期先按编译期与后端支持推算默认转码目标。
+        let startup = startup_consumer(&config, backend.as_ref());
         let transcode = crate::transcode::Transcoder::from_config(
             &config.media.transcode,
             std::env::var("LIUGUANG_TRANSCODE").ok().as_deref(),
@@ -1086,7 +1090,7 @@ impl Runtime {
             test_gap_applied: false,
             vaapi_verified_node: None,
             media: MediaIndex::default(),
-            caps,
+            caps: Mutex::new(None),
             transcode,
             pending_playback: Vec::new(),
             thumbs: crate::thumb::Service::new(),
@@ -1123,8 +1127,6 @@ impl Runtime {
             fullscreen_verify_due: None,
             fullscreen_suppressed: None,
             preload,
-            // 首次显示静态图时会被 `show_image` 按真实输出模式覆盖。
-            preload_dims: (2560, 1600),
             preload_stamps: HashMap::new(),
             pending_config: BTreeSet::new(),
             config_write_due: None,
@@ -1213,16 +1215,18 @@ impl Runtime {
         // 并据此纠正"设备恢复但无输出"时不该停在 InitializingDisplay 的问题。
         let created = self.init_channels();
         self.settle_headless_state();
-        // 恢复各通道画面。
-        let outputs: Vec<(String, CpuFrame)> = self
+        // 恢复各通道画面（静态图从当前媒体按需重渲染并上传）。
+        let outputs: Vec<String> = self
             .channels
             .iter()
-            .filter_map(|(k, c)| c.current.as_ref().map(|d| (k.clone(), d.frame.clone())))
+            .filter_map(|(k, c)| c.current.as_ref().map(|_| k.clone()))
             .collect();
-        for (key, frame) in outputs {
-            let logged = DisplayFrame::Cpu(frame.clone());
-            let res = self.present_frame(&key, frame);
-            let _ = self.record_present(&key, res, "后端恢复重放", &logged);
+        for key in outputs {
+            if let Some(frame) = self.replay_channel_frame(&key) {
+                let logged = DisplayFrame::Cpu(frame.clone());
+                let res = self.present_frame(&key, frame);
+                let _ = self.record_present(&key, res, "后端恢复重放", &logged);
+            }
         }
         // 设备恢复时新建的通道没人点过：真正点亮它们（而不是等 5s 后的热插拔复查，
         // 那条路径只在"通道不存在"时才会点亮，此时通道已经存在）。
@@ -1341,6 +1345,7 @@ impl Runtime {
                     last_playlist_retry: now,
                     last_rotation_error: None,
                     preload_target: None,
+                    preload_dims: (1920, 1080),
                     transition: None,
                     pending_target: None,
                 },
@@ -1359,11 +1364,7 @@ impl Runtime {
     /// - 没有画面 ⇒ 走一次媒体切换，**成功才**进入 StaticIdle/VideoPlaying；
     ///   失败保持 InitializingDisplay，并给出可操作日志（不静默、不假装）。
     fn light_up_channel(&mut self, key: &str) {
-        if let Some(frame) = self
-            .channels
-            .get(key)
-            .and_then(|ch| ch.current.as_ref().map(|d| d.frame.clone()))
-        {
+        if let Some(frame) = self.replay_channel_frame(key) {
             let logged = DisplayFrame::Cpu(frame.clone());
             let res = self.present_frame(key, frame);
             let _ = self.record_present(key, res, "热插拔重放", &logged);
@@ -2022,14 +2023,17 @@ impl Runtime {
         if !self.backend.poll_master_recovery() {
             return false;
         }
-        // 后端已重建资源：把每个静态通道的当前画面重新提交一次。
-        let frames: Vec<(String, CpuFrame)> = self
+        // 后端已重建资源：把每个静态通道的当前画面重新提交一次（按需渲染，不常驻副本）。
+        let replay_keys: Vec<String> = self
             .channels
             .iter()
-            .filter(|(_, ch)| ch.video.is_none())
-            .filter_map(|(k, ch)| ch.current.as_ref().map(|d| (k.clone(), d.frame.clone())))
+            .filter(|(_, ch)| ch.video.is_none() && ch.current.is_some())
+            .map(|(k, _)| k.clone())
             .collect();
-        for (key, frame) in frames {
+        for key in replay_keys {
+            let Some(frame) = self.replay_channel_frame(&key) else {
+                continue;
+            };
             let logged = DisplayFrame::Cpu(frame.clone());
             let res = self.present_frame(&key, frame);
             match self.record_present(&key, res, "master 自愈后重放", &logged) {
@@ -2242,13 +2246,29 @@ impl Runtime {
         //     把正在播的视频停掉（给游戏让出 CPU/GPU），退出后只恢复自己停的。
         //     采样与滞回都在方法内（500ms 采一次、状态要持续 1s 才生效）。
         self.poll_fullscreen(now);
-        // 0.5 预加载下一张（`performance.preload_next`）：一个 tick 最多一张。
+        // 0.5 预加载下一张（`performance.preload_next`）：仅在切换窗口临近时按需排期，一个 tick 最多一张。
+        let preload_keys: Vec<String> = self.channels.keys().cloned().collect();
+        for key in preload_keys {
+            let need_arm = self.channels.get(&key).is_some_and(|ch| {
+                ch.preload_target.is_none()
+                    && !ch.pinned
+                    && !ch.paused
+                    && ch.static_wallpaper.is_none()
+                    && ch.video.is_none()
+                    && ch.paused_video_media.is_none()
+            });
+            if need_arm {
+                self.schedule_next_preload_at(&key, now);
+            }
+        }
         self.run_pending_preloads();
         // 1. 转场/视频推进（按帧到期时刻精确唤醒）。
         let keys: Vec<String> = self.channels.keys().cloned().collect();
         for key in keys {
             plan.note(self.step_channel(&key, now));
         }
+        // 回收已不再使用的 Wayland 共享内存旧槽位（如转场结束或切图后释放的旧帧页）。
+        self.backend.reclaim_idle_buffers();
         // 1.5 坏播放源自愈（T68；限速）：文件回来/媒体库就绪后自动恢复，
         //     而不是让通道静默停摆到用户重启。
         self.retry_broken_playlists(now);
@@ -2551,20 +2571,65 @@ impl Runtime {
     /// 只预加载**图片**：缓存存的是解码后的 CPU 帧；"预加载视频"意味着提前开
     /// 一条解码管线（另一回事、另一份成本），不在本项语义内。
     fn schedule_next_preload(&mut self, key: &str) {
+        self.schedule_next_preload_at(key, Instant::now());
+    }
+
+    fn schedule_next_preload_at(&mut self, key: &str, now: Instant) {
         if !self.config.performance.preload_next {
             return;
         }
         let target = self
             .channels
             .get(key)
-            .filter(|ch| !ch.pinned)
+            .filter(|ch| {
+                !ch.pinned
+                    && !ch.paused
+                    && ch.static_wallpaper.is_none()
+                    && ch.video.is_none()
+                    && ch.paused_video_media.is_none()
+                    && ch
+                        .scheduler
+                        .next_due()
+                        .is_none_or(|due| due.saturating_duration_since(now) <= PRELOAD_LEAD_TIME)
+            })
             .and_then(|ch| ch.playlist.peek())
             .filter(|entry| entry.kind == MediaKind::Image)
             .map(|entry| entry.path.clone());
         if let Some(path) = target
+            && !self.preload.peek(&path)
             && let Some(ch) = self.channels.get_mut(key)
         {
             ch.preload_target = Some(path);
+        }
+    }
+
+    /// 清理不再被任何活跃（未暂停/未锁定/非视频）静态通道需要的预解码帧。
+    fn prune_unused_preloads(&mut self) {
+        if self.preload.is_empty() && self.preload_stamps.is_empty() {
+            return;
+        }
+        let mut needed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for ch in self.channels.values() {
+            if ch.pinned
+                || ch.paused
+                || ch.static_wallpaper.is_some()
+                || ch.video.is_some()
+                || ch.paused_video_media.is_some()
+            {
+                continue;
+            }
+            if let Some(target) = ch.preload_target.as_ref() {
+                needed.insert(target.clone());
+            }
+            if let Some(entry) = ch.playlist.peek().filter(|e| e.kind == MediaKind::Image) {
+                needed.insert(entry.path.clone());
+            }
+        }
+        let before = self.preload.len();
+        self.preload.retain(|p| needed.contains(p));
+        self.preload_stamps.retain(|p, _| self.preload.peek(p));
+        if self.preload.len() != before {
+            crate::thumb::trim_heap();
         }
     }
 
@@ -2601,7 +2666,7 @@ impl Runtime {
         if self.media.running.is_some() {
             return;
         }
-        let mut picked: Option<(String, PathBuf)> = None;
+        let mut picked: Option<(String, PathBuf, (u32, u32))> = None;
         for (key, ch) in self.channels.iter_mut() {
             let Some(target) = ch.preload_target.clone() else {
                 continue;
@@ -2610,10 +2675,10 @@ impl Runtime {
                 ch.preload_target = None;
                 continue;
             }
-            picked = Some((key.clone(), target));
+            picked = Some((key.clone(), target, ch.preload_dims));
             break;
         }
-        let Some((key, path)) = picked else {
+        let Some((key, path, dims)) = picked else {
             return;
         };
         if let Some(ch) = self.channels.get_mut(&key) {
@@ -2625,7 +2690,14 @@ impl Runtime {
             tracing::debug!(media = %path.display(), "素材无法 stat：跳过预加载");
             return;
         };
-        let dims = self.preload_dims;
+        if preload_exceeds_rss_budget(&path, dims) {
+            tracing::debug!(
+                output = %key,
+                media = %path.display(),
+                "进程 RSS 接近预算上限，跳过预解码（切图时再同步解码）"
+            );
+            return;
+        }
         match self.preload.preload_sized(&path, dims.0, dims.1) {
             Ok(()) => {
                 self.preload_stamps.insert(path.clone(), stamp);
@@ -2648,6 +2720,7 @@ impl Runtime {
         // 记账对齐：LRU 淘汰掉的条目，其文件凭据必须一起清 —— 否则每张走过的图
         // 都留一条凭据，`preload_stamps` 只增不减（这才是真的内存泄漏）。
         self.preload_stamps.retain(|p, _| self.preload.peek(p));
+        crate::thumb::trim_heap();
     }
 
     /// 取用预加载帧：**只有文件凭据一致**才算命中。
@@ -2677,32 +2750,30 @@ impl Runtime {
                 } else {
                     (elapsed.as_secs_f32() / active.duration.as_secs_f32()).clamp(0.0, 1.0)
                 };
-                match active.anim.render_at(progress) {
-                    Ok(frame) => {
-                        if progress >= 1.0 {
-                            Some(frame)
-                        } else {
-                            let f = frame;
-                            let logged = DisplayFrame::Cpu(f.clone());
-                            let res = self.present_frame(key, f);
+                if progress >= 1.0 {
+                    Some(ch.pending_target.take().unwrap_or_else(|| {
+                        active
+                            .anim
+                            .render_at(1.0)
+                            .unwrap_or_else(|_| fallback_1x1_frame())
+                    }))
+                } else {
+                    match active.anim.render_at(progress) {
+                        Ok(frame) => {
+                            let logged = DisplayFrame::Cpu(frame.clone());
+                            let res = self.present_frame(key, frame);
                             let _ = self.record_present(key, res, "转场帧", &logged);
                             return Some(Instant::now() + TRANSITION_FRAME_INTERVAL);
                         }
-                    }
-                    Err(e) => {
-                        tracing::warn!(output = %key, error = %e, "转场渲染失败，回退立即切换");
-                        Some(ch.pending_target.take().unwrap_or_else(|| {
-                            ch.current
-                                .as_ref()
-                                .map(|d| d.frame.clone())
-                                .unwrap_or_else(|| CpuFrame {
-                                    width: 1,
-                                    height: 1,
-                                    stride: 4,
-                                    format: liuguang_core::types::PixelFormat::Xrgb8888,
-                                    data: Arc::from(vec![0u8; 4].into_boxed_slice()),
-                                })
-                        }))
+                        Err(e) => {
+                            tracing::warn!(output = %key, error = %e, "转场渲染失败，回退立即切换");
+                            Some(ch.pending_target.take().unwrap_or_else(|| {
+                                ch.current
+                                    .as_ref()
+                                    .and_then(|d| d.frame.clone())
+                                    .unwrap_or_else(fallback_1x1_frame)
+                            }))
+                        }
                     }
                 }
             } else {
@@ -2717,12 +2788,16 @@ impl Runtime {
             let logged = DisplayFrame::Cpu(frame.clone());
             let res = self.present_frame(key, frame);
             let _ = self.record_present(key, res, "转场结束帧", &logged);
+            drop(logged);
+            self.backend.reclaim_idle_buffers();
+            crate::thumb::trim_heap();
             // 转场真正结束：这里才宣布"新画面已生效"，顶层状态收敛到稳定态
             // （而不是在 show_image 里提前宣布，导致 status 说 StaticIdle 而画面还在动）。
             self.drive_shown(key);
         }
 
         // 视频帧推进：期限由媒体层给出（`poll_video`），必须原样向上传播。
+        let mut unloaded_on_pause = false;
         let (video_frame, video_next, video_error) = {
             let ch = self.channels.get_mut(key)?;
             if ch.paused {
@@ -2742,29 +2817,35 @@ impl Runtime {
                     (media_kind_for_path(&c.media) == MediaKind::Video && c.media.exists())
                         .then(|| c.media.clone())
                 });
-                if ch.video.is_some() {
-                    if let Some(media) = unloadable_media {
-                        let elapsed = now.saturating_duration_since(started);
-                        if elapsed >= PAUSE_UNLOAD_DELAY {
-                            ch.video = None;
-                            ch.paused_video_media = Some(media);
-                            tracing::info!(
-                                output = %key,
-                                paused_secs = elapsed.as_secs(),
-                                "视频暂停超过阈值，已卸载解码与渲染管线以释放显存/内存（恢复播放时自动重建）"
-                            );
-                            crate::thumb::trim_heap();
-                            return None;
-                        }
-                        return Some(started + PAUSE_UNLOAD_DELAY);
-                    }
+                let media = unloadable_media.filter(|_| ch.video.is_some())?;
+                let elapsed = now.saturating_duration_since(started);
+                if elapsed >= PAUSE_UNLOAD_DELAY {
+                    ch.video = None;
+                    ch.paused_video_media = Some(media);
+                    tracing::info!(
+                        output = %key,
+                        paused_secs = elapsed.as_secs(),
+                        "视频暂停超过阈值，已卸载解码与渲染管线以释放显存/内存（恢复播放时自动重建）"
+                    );
+                    unloaded_on_pause = true;
+                    (None, None, None)
+                } else {
+                    return Some(started + PAUSE_UNLOAD_DELAY);
                 }
-                return None;
+            } else {
+                let video = ch.video.as_mut()?;
+                let tick = poll_video(video.as_mut(), now);
+                (tick.frame, tick.next_wake, tick.error)
             }
-            let video = ch.video.as_mut()?;
-            let tick = poll_video(video.as_mut(), now);
-            (tick.frame, tick.next_wake, tick.error)
         };
+        if unloaded_on_pause {
+            #[cfg(feature = "vaapi")]
+            if !self.channels.values().any(|ch| ch.video.is_some()) {
+                liuguang_vaapi::forget_all_devices();
+            }
+            crate::thumb::trim_heap();
+            return None;
+        }
         // T68：视频播完一轮（PTS 回卷）⇒ 按 `on_video_end` 决定前进还是留在当前项。
         //
         // 放在"取帧"之后、"提交该帧"之前：回卷后的第一帧属于新一轮，前进时它会被
@@ -3082,18 +3163,7 @@ impl Runtime {
                     body
                 }
             })?;
-        if let Some(ch) = self.channels.get_mut(key) {
-            let is_video = ch.video.is_some();
-            if let Some(cur) = &mut ch.current {
-                // 视频帧不驻留像素（RSS：每帧 12–33MB，且仅用于热插拔恢复，
-                // 恢复时重建视频通道即可）；NV12/DMA-BUF 亦不作为静态回退。
-                if let DisplayFrame::Cpu(cpu) = frame {
-                    if !is_video && !cpu.format.is_semi_planar() {
-                        cur.frame = cpu;
-                    }
-                }
-            }
-        }
+        // 静态画面已提交到 wl_shm 后不再在 Rust 堆中保留第二份 4K 像素副本，节省 ~32 MiB RSS/PSS。
         // **提交之后**再 dump 一次同一缓冲（`LIUGUANG_FRAME_PROBE_POST=1` 时）：
         // 若 flips 是阻塞式（当前实现不带 NONBLOCK），这里已是"flip 完成之后"，
         // 因此 `.pre` vs `.post` 的差异就能判定"缓冲是否在扫描输出期间被改写"。
@@ -3187,6 +3257,95 @@ impl Runtime {
         }
     }
 
+    /// 静态图片解码→旋转→亮度→fit 光栅化（`rgba` 临时帧在作用域结束立即释放，不常驻堆中）。
+    fn render_channel_image(
+        &mut self,
+        key: &str,
+        path: &Path,
+        take_preloaded: bool,
+    ) -> Result<(CpuFrame, liuguang_core::types::DisplayMode), ErrorBody> {
+        let output = OutputId::new(key);
+        let mode_str = self.config.display.mode.clone();
+        let selection = ModeSelection::parse(&mode_str)
+            .map_err(|e| ErrorBody::new(ErrorKind::InvalidParams, format!("模式非法: {e}")))?;
+        let mode = self
+            .backend
+            .resolve_mode(&output, &selection)
+            .map_err(|e| ErrorBody::new(ErrorKind::UnknownOutput, e.to_string()))?;
+        let fitted = (
+            mode.width.saturating_add(mode.width / 4).max(64),
+            mode.height.saturating_add(mode.height / 4).max(64),
+        );
+        if let Some(ch) = self.channels.get_mut(key) {
+            ch.preload_dims = fitted;
+        }
+        let fit_params = self.default_fit_params(key);
+        let rotation = self
+            .config
+            .outputs
+            .get(key)
+            .map(|o| o.rotation)
+            .unwrap_or(Rotation::Deg0);
+        let brightness = self
+            .config
+            .outputs
+            .get(key)
+            .map(|o| o.brightness)
+            .unwrap_or(1.0);
+        let cached = if take_preloaded {
+            self.take_preloaded(path)
+        } else {
+            None
+        };
+        let scanout = {
+            let rgba = match cached {
+                Some(cached) => {
+                    tracing::debug!(media = %path.display(), "预加载命中：跳过展示时刻的同步解码");
+                    cached
+                }
+                None => prepare_image_fitted(path, fitted.0, fitted.1).map_err(|e| {
+                    ErrorBody::new(
+                        ErrorKind::FileUnavailable,
+                        format!("PNG 解码失败（{}）: {e}", path.display()),
+                    )
+                })?,
+            };
+            let rgba = liuguang_core::transform::rotate_frame(&rgba, rotation)
+                .map_err(|e| ErrorBody::new(ErrorKind::Internal, format!("旋转失败: {e}")))?;
+            let rgba = liuguang_core::transform::scale_brightness(&rgba, brightness)
+                .map_err(|e| ErrorBody::new(ErrorKind::Internal, format!("亮度调节失败: {e}")))?;
+            render_fit(&rgba, (mode.width, mode.height), &fit_params, [0, 0, 0])
+                .map_err(|e| ErrorBody::new(ErrorKind::Internal, format!("渲染失败: {e}")))?
+        };
+        tracing::debug!(
+            output = %key,
+            media = %path.display(),
+            fit = ?fit_params.mode,
+            zoom = fit_params.zoom,
+            "静态图像光栅化完成"
+        );
+        Ok((scanout, mode))
+    }
+
+    /// 断线恢复/自愈/转场时按需获取当前通道帧（`frame: Some` 直接取，否则按静态图重渲染）。
+    fn replay_channel_frame(&mut self, key: &str) -> Option<CpuFrame> {
+        let (cached, media) = {
+            let ch = self.channels.get(key)?;
+            let cur = ch.current.as_ref()?;
+            (cur.frame.clone(), cur.media.clone())
+        };
+        if let Some(frame) = cached {
+            return Some(frame);
+        }
+        if media_kind_for_path(&media) == MediaKind::Image {
+            return self
+                .render_channel_image(key, &media, false)
+                .ok()
+                .map(|(frame, _)| frame);
+        }
+        None
+    }
+
     /// 静态图片路径（解码→旋转→fit→[转场]→提交）。
     fn show_image(
         &mut self,
@@ -3201,64 +3360,12 @@ impl Runtime {
             ));
         }
         let path = self.check_media_path(path)?;
-
-        // 先解析输出模式（只读，不碰设备）：解码要按它的 1.25 倍做**降采样**，
-        // 否则 61 MP 的 PNG 会先解出 244 MB 的 RGBA 再缩到 2560×1600（§性能/内存）。
-        let output = OutputId::new(key);
-        let mode_str = self.config.display.mode.clone();
-        let selection = ModeSelection::parse(&mode_str)
-            .map_err(|e| ErrorBody::new(ErrorKind::InvalidParams, format!("模式非法: {e}")))?;
-        let mode = self
-            .backend
-            .resolve_mode(&output, &selection)
-            .map_err(|e| ErrorBody::new(ErrorKind::UnknownOutput, e.to_string()))?;
-        let fitted = (
-            mode.width.saturating_add(mode.width / 4).max(64),
-            mode.height.saturating_add(mode.height / 4).max(64),
-        );
-        self.preload_dims = fitted;
-
-        // 先解码，坏图不触碰显示设备。轮换前已预加载过的直接复用
-        // （`performance.preload_next`；凭据不符按未命中处理）。
-        let rgba = match self.take_preloaded(&path) {
-            Some(cached) => {
-                tracing::debug!(media = %path.display(), "预加载命中：跳过展示时刻的同步解码");
-                cached
-            }
-            None => prepare_image_fitted(&path, fitted.0, fitted.1).map_err(|e| {
-                ErrorBody::new(
-                    ErrorKind::FileUnavailable,
-                    format!("PNG 解码失败（{}）: {e}", path.display()),
-                )
-            })?,
-        };
-
-        let rotation = self
-            .config
-            .outputs
-            .get(key)
-            .map(|o| o.rotation)
-            .unwrap_or(Rotation::Deg0);
-        let brightness = self
-            .config
-            .outputs
-            .get(key)
-            .map(|o| o.brightness)
-            .unwrap_or(1.0);
-        let rgba = liuguang_core::transform::rotate_frame(&rgba, rotation)
-            .map_err(|e| ErrorBody::new(ErrorKind::Internal, format!("旋转失败: {e}")))?;
-        let rgba = liuguang_core::transform::scale_brightness(&rgba, brightness)
-            .map_err(|e| ErrorBody::new(ErrorKind::Internal, format!("亮度调节失败: {e}")))?;
-
+        let (scanout, mode) = self.render_channel_image(key, &path, true)?;
         self.backend
-            .set_mode(output.clone(), mode)
+            .set_mode(OutputId::new(key), mode)
             .map_err(|e| ErrorBody::new(ErrorKind::DeviceUnavailable, e.to_string()))?;
 
         let fit_params = self.default_fit_params(key);
-        let scanout = render_fit(&rgba, (mode.width, mode.height), &fit_params, [0, 0, 0])
-            .map_err(|e| ErrorBody::new(ErrorKind::Internal, format!("渲染失败: {e}")))?;
-        // 可观测：把**实际用于渲染**的 fit/zoom/offset 打出来。用户曾无法判断
-        // `--fit/--zoom` 到底有没有生效（AUDIT §2.1 的"静默 no-op"）。
         tracing::info!(
             output = %key,
             media = %path.display(),
@@ -3279,21 +3386,20 @@ impl Runtime {
             && self.transitions.effect != "none"
             && self.config.transition.enabled
             && self.transitions.duration_ms > 0;
-        let previous = self
-            .channels
-            .get(key)
-            .and_then(|c| c.current.as_ref().map(|d| d.frame.clone()));
-        if do_transition {
-            if let (Some(from), Some(ch)) = (previous, self.channels.get_mut(key)) {
-                let mut anim = CpuTransition::new(self.transitions.to_spec());
-                if anim.prepare_frames(from, scanout.clone()).is_ok() {
-                    ch.transition = Some(ActiveTransition {
-                        anim,
-                        started: Instant::now(),
-                        duration: Duration::from_millis(u64::from(self.transitions.duration_ms)),
-                    });
-                    ch.pending_target = Some(scanout.clone());
-                }
+        let previous = if do_transition {
+            self.replay_channel_frame(key)
+        } else {
+            None
+        };
+        if let (Some(from), Some(ch)) = (previous, self.channels.get_mut(key)) {
+            let mut anim = CpuTransition::new(self.transitions.to_spec());
+            if anim.prepare_frames(from, scanout.clone()).is_ok() {
+                ch.transition = Some(ActiveTransition {
+                    anim,
+                    started: Instant::now(),
+                    duration: Duration::from_millis(u64::from(self.transitions.duration_ms)),
+                });
+                ch.pending_target = Some(scanout.clone());
             }
         }
         let started_transition = self
@@ -3302,7 +3408,8 @@ impl Runtime {
             .map(|c| c.transition.is_some())
             .unwrap_or(false);
         if !started_transition {
-            self.present_frame(key, scanout.clone())?;
+            self.present_frame(key, scanout)?;
+            crate::thumb::trim_heap();
         }
         // 状态机接线（每一步都必须是合法转移）：
         //  - 有转场：停在 `Transitioning`，由转场**真正结束**时收敛（step_channel）；
@@ -3333,7 +3440,7 @@ impl Runtime {
             ch.last_rotation_error = None;
             ch.current = Some(CurrentDisplay {
                 media: path.to_path_buf(),
-                frame: scanout,
+                frame: None,
                 mode_str,
                 decoder: "static".to_string(),
             });
@@ -3384,8 +3491,12 @@ impl Runtime {
         // **t15**：硬件解不动的素材先转码成可硬解的缓存，绝不静默软解。
         // 缓存已就绪 ⇒ 换成缓存路径；否则登记"转完自动播"并回 NEEDS_PREPARATION。
         let path = self.ensure_playable_video(key, path)?;
-        // 切到新视频前先拆掉旧管线（避免两条解码管线并行解码）。
+        // 切到新视频前先拆掉旧管线，并清空不再被静态通道使用的预解码帧。
         self.stop_video(key);
+        if let Some(ch) = self.channels.get_mut(key) {
+            ch.preload_target = None;
+        }
+        self.prune_unused_preloads();
         #[cfg(feature = "gstreamer")]
         {
             let policy = video_policy(&self.config);
@@ -3423,6 +3534,7 @@ impl Runtime {
                     // 这个后端已经收过 VA-API 的帧：后续同节点+同模式 set 不必再同步等首帧（t43）。
                     self.vaapi_verified_node = Some((node, needs_rgb));
                 }
+                crate::thumb::trim_heap();
                 return attached;
             }
             // t33：能走到这里，说明 VA-API 这一路没成（`open_vaapi_producer` 的
@@ -3698,13 +3810,7 @@ impl Runtime {
             ch.pending_target = None;
             ch.current = Some(CurrentDisplay {
                 media: path.to_path_buf(),
-                frame: CpuFrame {
-                    width: 1,
-                    height: 1,
-                    stride: 4,
-                    format: liuguang_core::types::PixelFormat::Xrgb8888,
-                    data: Arc::from(vec![0u8; 4].into_boxed_slice()),
-                },
+                frame: None,
                 mode_str: format!("{}x{}@{:.3}", mode.width, mode.height, mode.refresh_hz()),
                 decoder: decoder.clone(),
             });
@@ -4442,8 +4548,14 @@ impl Runtime {
             })
             .unwrap_or(false);
         if had {
-            crate::thumb::trim_heap();
             tracing::debug!(output = %key, "视频管线已拆除（解码线程停止）");
+        }
+        #[cfg(feature = "vaapi")]
+        if !self.channels.values().any(|ch| ch.video.is_some()) {
+            liuguang_vaapi::forget_all_devices();
+        }
+        if had {
+            crate::thumb::trim_heap();
         }
         had
     }
@@ -4864,6 +4976,7 @@ impl Runtime {
                     }
                     let clean = outcome.is_clean();
                     self.media.items = outcome.items;
+                    crate::thumb::trim_heap();
                     if clean {
                         tracing::info!(scan_id = outcome.scan_id, %summary, "扫描完成");
                     } else if outcome.cancelled {
@@ -5183,13 +5296,15 @@ impl Runtime {
             // 与 `list_media` 的扫描结果保持同一口径：详情来自头部探测。
             details: crate::probe::probe(&resolved, kind),
         };
-        // t15/t37：带上"这条输出能不能直接播"的分类。判据必须与 `set_wallpaper`
-        // 完全一致（同一份 consumer），否则会出现"读接口说 playable、一播却要转码"。
-        // 位置深不值得单独探测 —— 这里复用 `classify_path`（图片直接 Playable，
-        // 视频才读容器头补位深/色度）。
-        let consumer = self.consumer_for_request(None);
-        let caps = self.hardware_caps().with_consumer(consumer);
-        let (_, verdict) = crate::compat::classify_path(&resolved, kind, &caps);
+        // t15/t37：图片直接 Playable，免去静态壁纸模式下触发 VA-API 设备探测；
+        // 仅视频读取硬件与输出 consumer 做兼容性判定。
+        let verdict = if kind != "video" {
+            crate::compat::Compatibility::Playable
+        } else {
+            let consumer = self.consumer_for_request(None);
+            let caps = self.hardware_caps().with_consumer(consumer);
+            crate::compat::classify_path(&resolved, kind, &caps).1
+        };
         ok_response(
             id,
             &liuguang_ipc::protocol::GetMediaResult {
@@ -5393,9 +5508,19 @@ impl Runtime {
 
     // ===== t15：自动兼容（能力判定 + 后台转码缓存） =====
 
-    /// 本机解码能力（构造期探测一次，这里只是拿快照）。
+    /// 本机解码能力（按需懒探测并缓存）。
     fn hardware_caps(&self) -> crate::compat::HardwareCaps {
-        self.caps.clone()
+        if let Some(cached) = self
+            .caps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return cached;
+        }
+        let detected = crate::compat::HardwareCaps::detect(self.config.media.transcode_max_width);
+        let mut guard = self.caps.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get_or_insert(detected).clone()
     }
 
     /// 转码任务规格（**按输出的实际解码路径**定产物，t37）。
@@ -5456,24 +5581,16 @@ impl Runtime {
     }
 
     /// 这个输出**此刻实际**会用的解码路径（t33）。
-    ///
-    /// 构造期探测的 `caps.consumer` 只回答"这台机器大体上能不能硬解"；运行时还有
-    /// 三条路会把它推翻，而且都能在 `set_wallpaper` 之前就知道：
-    /// 没编 `vaapi` feature、设置项把 VA-API 关掉、后端不支持 DMA-BUF 扫描输出。
-    /// 判据必须与 [`Self::open_vaapi_producer`] 对齐——否则会出现 t28 F2 的现场：
-    /// 判 playable 的 `.mkv`，开屏时被 GStreamer 的 `qtdemux` 拒绝
-    /// （`atom has bogus size`），用户看到的是 `UNSUPPORTED_CODEC`。
     fn playback_consumer(&self, key: &str) -> crate::compat::DecodeConsumer {
         let latched = self.channels.get(key).is_some_and(|ch| ch.dmabuf_latched);
-        let consumer = if latched {
+        let consumer = if latched
+            || !cfg!(feature = "vaapi")
+            || !self.vaapi_setting_enabled()
+            || !self.backend.supports_dmabuf_scanout()
+        {
             crate::compat::DecodeConsumer::GStreamer
         } else {
-            crate::compat::DecodeConsumer::for_playback(
-                cfg!(feature = "vaapi"),
-                self.vaapi_setting_enabled(),
-                self.backend.supports_dmabuf_scanout(),
-                self.caps.consumer,
-            )
+            self.hardware_caps().consumer
         };
         tracing::debug!(
             output = key,
@@ -5539,7 +5656,7 @@ impl Runtime {
             );
             return Ok(path);
         }
-        let caps = self.caps.clone().with_consumer(consumer);
+        let caps = self.hardware_caps().with_consumer(consumer);
         let (details, verdict) = crate::compat::classify_path(&path, "video", &caps);
         match verdict {
             Compatibility::Playable => Ok(path),
@@ -5719,7 +5836,7 @@ impl Runtime {
         }
         // t37：与 `set_wallpaper` 用同一条输出的 consumer（判定/转码/播放三处一致）。
         let consumer = self.consumer_for_request(None);
-        let caps = self.caps.clone().with_consumer(consumer);
+        let caps = self.hardware_caps().with_consumer(consumer);
         let (details, verdict) = crate::compat::classify_path(&resolved, kind, &caps);
         match verdict {
             Compatibility::Playable => ok_response(
@@ -6933,11 +7050,13 @@ impl Runtime {
     fn pause_video_supply(&mut self, key: &str) {
         if let Some(ch) = self.channels.get_mut(key) {
             ch.paused = true;
+            ch.preload_target = None;
             ch.scheduler.pause();
             if let Some(video) = ch.video.as_mut() {
                 let _ = video.pause();
             }
         }
+        self.prune_unused_preloads();
     }
 
     /// 恢复一条通道的视频供给，并把停摆看门狗交给下一个 tick 重新计时。
@@ -7189,7 +7308,11 @@ impl Runtime {
             }
         }
         if params.pinned {
+            if let Some(ch) = self.channels.get_mut(&key) {
+                ch.preload_target = None;
+            }
             self.clear_preload_if_all_pinned();
+            self.prune_unused_preloads();
         }
         tracing::info!(
             output = %key,
@@ -7266,9 +7389,11 @@ impl Runtime {
             .map(|ch| {
                 let same = ch.static_wallpaper.as_deref() == Some(path.as_path());
                 ch.static_wallpaper = Some(path.clone());
+                ch.preload_target = None;
                 same
             })
             .unwrap_or(false);
+        self.prune_unused_preloads();
         ok_response(
             id,
             &serde_json::json!({
@@ -7432,9 +7557,8 @@ impl Runtime {
                 self.log_pending_config("reload");
                 // 同步转场默认值与各通道调度间隔。
                 self.transitions = transition_settings_from_config(&self.config.transition);
-                self.caps =
-                    crate::compat::HardwareCaps::detect(self.config.media.transcode_max_width);
-                let startup = startup_consumer(&self.config, self.backend.as_ref(), &self.caps);
+                *self.caps.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                let startup = startup_consumer(&self.config, self.backend.as_ref());
                 self.transcode.reconfigure(
                     &self.config.media.transcode,
                     std::env::var("LIUGUANG_TRANSCODE").ok().as_deref(),
@@ -8768,16 +8892,7 @@ pub fn run(opts: DaemonOptions) -> Result<(), String> {
         );
     }
 
-    // **t46**：GStreamer 插件注册表预热（后台线程），放在 LIBVA_DRIVER_NAME 固化之后启动，
-    // 既避免与 `set_var` 产生多线程竞态，也让 GStreamer 注册表看到正确的 VA 驱动环境。
-    #[cfg(feature = "gstreamer")]
-    std::thread::Builder::new()
-        .name("liuguang-gst-warmup".to_string())
-        .spawn(|| {
-            let _ = gstreamer::init();
-            let _ = gstreamer::Registry::get();
-        })
-        .ok();
+    // 静态图模式下按需再加载 GStreamer 插件，避免启动期后台预热拖入 libgstva / libLLVM。
 
     let config = if opts.config_path.exists() {
         let mut cfg = Config::load(&opts.config_path)
@@ -8992,6 +9107,34 @@ fn open_drm_backend(device: &str) -> Option<Box<dyn DisplayBackend>> {
 #[cfg(not(target_os = "linux"))]
 fn open_drm_backend(_device: &str) -> Option<Box<dyn DisplayBackend>> {
     None
+}
+
+fn fallback_1x1_frame() -> CpuFrame {
+    CpuFrame {
+        width: 1,
+        height: 1,
+        stride: 4,
+        format: liuguang_core::types::PixelFormat::Xrgb8888,
+        data: Arc::from(vec![0u8; 4].into_boxed_slice()),
+    }
+}
+
+fn preload_exceeds_rss_budget(path: &Path, dims: (u32, u32)) -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    let est_bytes = crate::probe::probe_image(path)
+        .map(|d| {
+            let step = (d.width.div_ceil(dims.0.max(1)))
+                .max(d.height.div_ceil(dims.1.max(1)))
+                .max(1);
+            u64::from(d.width.div_ceil(step))
+                .saturating_mul(u64::from(d.height.div_ceil(step)))
+                .saturating_mul(4)
+        })
+        .unwrap_or_else(|| u64::from(dims.0) * u64::from(dims.1) * 4);
+    let rss = crate::sysstat::read_mem_bytes();
+    rss > 0 && rss.saturating_add(est_bytes) > PRELOAD_RSS_SOFT_LIMIT_BYTES
 }
 
 #[cfg(test)]
@@ -9635,12 +9778,8 @@ mod tests {
             .count()
     }
 
-    fn current_frame(rt: &Runtime, key: &str) -> CpuFrame {
-        rt.channels
-            .get(key)
-            .and_then(|c| c.current.as_ref())
-            .map(|d| d.frame.clone())
-            .expect("通道应有当前画面")
+    fn current_frame(rt: &mut Runtime, key: &str) -> CpuFrame {
+        rt.replay_channel_frame(key).expect("通道应有当前画面")
     }
 
     fn current_media(rt: &Runtime, key: &str) -> String {
@@ -9673,7 +9812,7 @@ mod tests {
         assert!(r.ok, "set 应被受理");
         assert_eq!(r.result.unwrap()["accepted"], true);
         // 行为断言：真的出现了黑边（= contain 生效）。
-        let black = black_pixels(&current_frame(&rt, "DP-1"));
+        let black = black_pixels(&current_frame(&mut rt, "DP-1"));
         assert!(
             black > 1000,
             "fit=contain 必须产生黑边；黑像素只有 {black}，说明 --fit 被丢弃了（P0-1 复发）"
@@ -11611,10 +11750,9 @@ mod tests {
         // 装一个"当前在放视频"的通道事实（单测里无法真的解码 mp4）。
         {
             let ch = rt.channels.get_mut("DP-1").expect("通道");
-            let frame = ch.current.as_ref().expect("静态图已上屏").frame.clone();
             ch.current = Some(CurrentDisplay {
                 media: vid.clone(),
-                frame,
+                frame: None,
                 mode_str: "1920x1080@60.000".into(),
                 decoder: "video(vaapi):vah264dec(dmabuf)".into(),
             });
@@ -11633,17 +11771,8 @@ mod tests {
         down.store(true, std::sync::atomic::Ordering::SeqCst);
         // 先让它真的提交一次：后端据此把 master 标记为"已确定不是"
         // （判据来自提交 EACCES，与真机同源），再模拟随之而来的视频失败。
-        let probe_frame = rt
-            .channels
-            .get("DP-1")
-            .expect("通道")
-            .current
-            .as_ref()
-            .expect("静态图")
-            .frame
-            .clone();
         assert!(
-            rt.present_frame("DP-1", probe_frame).is_err(),
+            rt.present_frame("DP-1", fallback_1x1_frame()).is_err(),
             "master 缺失时提交必须失败"
         );
         assert!(
@@ -16112,9 +16241,10 @@ mod tests {
         let toml = toml_with_library(&env, 1);
         let mut rt = env.runtime(&toml);
         // 设备级探测的默认值（VA-API 构建的常见结果）——旧实现直接拿它判 compat。
-        rt.caps = crate::compat::HardwareCaps::default();
+        *rt.caps.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(crate::compat::HardwareCaps::default());
         assert_eq!(
-            rt.caps.consumer,
+            rt.hardware_caps().consumer,
             crate::compat::DecodeConsumer::Vaapi,
             "前提：设备级 caps 说是 VA-API"
         );

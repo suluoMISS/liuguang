@@ -388,9 +388,62 @@ pub fn select_consumer(vaapi_compiled: bool, device_opens: bool) -> DecodeConsum
     }
 }
 
-/// 试着打开一个 VA-API 渲染节点（几百微秒，构造期只跑一次）。
+/// 内部子进程参数：在子进程内探查 VA-API 节点可否打开，避免将 libLLVM 等驱动永久钉入主进程。
+pub const INTERNAL_PROBE_VAAPI_ARG: &str = "--internal-probe-vaapi";
+
+/// 子进程探测入口（由 `lib::main_entry` 在极早期分发）。
+#[must_use]
+pub fn run_internal_vaapi_probe() -> u8 {
+    #[cfg(feature = "vaapi")]
+    {
+        u8::from(!vaapi_device_opens_in_process())
+    }
+    #[cfg(not(feature = "vaapi"))]
+    {
+        1
+    }
+}
+
+/// 试着打开一个 VA-API 渲染节点（在非单测环境下优先走短命子进程，避免主进程常驻 libLLVM/Mesa）。
 #[cfg(feature = "vaapi")]
 fn vaapi_device_opens() -> bool {
+    if !cfg!(test)
+        && let Some(opens) = probe_vaapi_in_subprocess()
+    {
+        return opens;
+    }
+    vaapi_device_opens_in_process()
+}
+
+#[cfg(feature = "vaapi")]
+fn probe_vaapi_in_subprocess() -> Option<bool> {
+    let exe = std::env::current_exe().ok()?;
+    let mut child = Command::new(exe)
+        .arg(INTERNAL_PROBE_VAAPI_ARG)
+        .env("MALLOC_ARENA_MAX", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.success()),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "vaapi")]
+fn vaapi_device_opens_in_process() -> bool {
     const NODES: [&str; 3] = [
         "/dev/dri/renderD128",
         "/dev/dri/renderD129",
