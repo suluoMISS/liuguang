@@ -76,6 +76,9 @@ pub const INTERNAL_THUMB_WORKER_ARG: &str = "--internal-thumb-worker";
 /// 缩略图子进程空闲超时后自动退出，归还全部 GStreamer 插件与匿名页。
 const CHILD_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// 单次缩略图子进程请求的读超时上限（覆盖 GStreamer 预滚/seek/拉帧，防止卡死永久阻塞 worker）。
+const CHILD_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// 若输入确认为 PNG 文件（匹配 IHDR 签名），使用纯 Rust 流式降采样解码，绕开 GStreamer。
 fn decode_png_direct(path: &Path, max_w: u32, max_h: u32) -> Result<Option<Thumbnail>, String> {
     use std::io::Read as _;
@@ -83,8 +86,8 @@ fn decode_png_direct(path: &Path, max_w: u32, max_h: u32) -> Result<Option<Thumb
     if max_w == 0 || max_h == 0 {
         return Err("缩略图尺寸不能为 0".to_string());
     }
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
     let mut head = [0u8; 8];
     let n = file
         .read(&mut head)
@@ -935,7 +938,7 @@ struct ChildThumbResp {
 
 struct ThumbChild {
     stdin: Option<std::io::BufWriter<std::process::ChildStdin>>,
-    stdout: std::io::BufReader<std::process::ChildStdout>,
+    stdout_rx: Receiver<std::io::Result<Option<String>>>,
     child: std::process::Child,
 }
 
@@ -956,16 +959,47 @@ impl ThumbChild {
             .spawn()
             .ok()?;
         let stdin = std::io::BufWriter::new(child.stdin.take()?);
-        let stdout = std::io::BufReader::new(child.stdout.take()?);
+        let stdout = child.stdout.take()?;
+        let (tx, stdout_rx) = std::sync::mpsc::channel();
+        if std::thread::Builder::new()
+            .name("liuguang-thumb-child-rx".into())
+            .spawn(move || {
+                use std::io::BufRead as _;
+                let mut reader = std::io::BufReader::new(stdout);
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => {
+                            let _ = tx.send(Ok(None));
+                            break;
+                        }
+                        Ok(_) => {
+                            if tx.send(Ok(Some(line))).is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            let _ = tx.send(Err(err));
+                            break;
+                        }
+                    }
+                }
+            })
+            .is_err()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
         Some(Self {
             stdin: Some(stdin),
-            stdout,
+            stdout_rx,
             child,
         })
     }
 
     fn request(&mut self, req: &Request) -> Result<Decoded, String> {
-        use std::io::{BufRead as _, Write as _};
+        use std::io::Write as _;
         let payload = ChildThumbReq {
             path: req.path.clone(),
             max_w: req.max_w,
@@ -982,14 +1016,21 @@ impl ThumbChild {
             .and_then(|()| stdin.write_all(b"\n"))
             .and_then(|()| stdin.flush())
             .map_err(|e| format!("向缩略图子进程写入请求失败: {e}"))?;
-        let mut line = String::new();
-        let read = self
-            .stdout
-            .read_line(&mut line)
-            .map_err(|e| format!("读取缩略图子进程响应失败: {e}"))?;
-        if read == 0 {
-            return Err("缩略图子进程意外退出".to_string());
-        }
+        let line = match self.stdout_rx.recv_timeout(CHILD_REQUEST_TIMEOUT) {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => return Err("缩略图子进程意外退出".to_string()),
+            Ok(Err(e)) => return Err(format!("读取缩略图子进程响应失败: {e}")),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let _ = self.child.kill();
+                return Err(format!(
+                    "读取缩略图子进程响应超时（>{}s）",
+                    CHILD_REQUEST_TIMEOUT.as_secs()
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("缩略图子进程响应通道意外关闭".to_string());
+            }
+        };
         let resp: ChildThumbResp =
             serde_json::from_str(&line).map_err(|e| format!("解析缩略图子进程响应失败: {e}"))?;
         if !resp.ok {

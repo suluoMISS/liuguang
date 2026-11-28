@@ -168,7 +168,11 @@ pub fn main_entry() -> ExitCode {
     // 新前缀优先：`LIUGUANG_FOO` 视同 `LIUGUANG_FOO`（仅在后者未设置时复制）。
     // 这样文档里可以写 liuguang 前缀，而内部 40+ 处读取不必逐个改。
     alias_env_prefix();
-    match std::env::args_os().nth(1).and_then(|s| s.into_string().ok()).as_deref() {
+    match std::env::args_os()
+        .nth(1)
+        .and_then(|s| s.into_string().ok())
+        .as_deref()
+    {
         Some(thumb::INTERNAL_THUMB_WORKER_ARG) => {
             return ExitCode::from(thumb::run_internal_worker_main());
         }

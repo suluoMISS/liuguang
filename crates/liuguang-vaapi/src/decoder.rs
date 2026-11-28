@@ -458,7 +458,8 @@ impl VaapiDecoder {
             unsafe { av_dict_set(&raw mut codec_opts, key.as_ptr(), value.as_ptr(), 0) };
         }
         // SAFETY: codec 有效且已配置；codec_opts 由 avcodec_open2 消费并在下方释放。
-        let opened = unsafe { ffi::avcodec_open2(self.codec, std::ptr::null(), &raw mut codec_opts) };
+        let opened =
+            unsafe { ffi::avcodec_open2(self.codec, std::ptr::null(), &raw mut codec_opts) };
         // SAFETY: 释放 avcodec_open2 后剩余的未识别键字典，空指针安全。
         unsafe { av_dict_free(&raw mut codec_opts) };
         profile_stage("avcodec_open2", stage.elapsed());

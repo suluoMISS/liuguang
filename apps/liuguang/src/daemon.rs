@@ -198,11 +198,9 @@ fn startup_consumer(
     config: &Config,
     backend: &dyn DisplayBackend,
 ) -> crate::compat::DecodeConsumer {
-    let probed = if cfg!(feature = "vaapi") {
-        crate::compat::DecodeConsumer::Vaapi
-    } else {
-        crate::compat::DecodeConsumer::GStreamer
-    };
+    // 复用短命子进程探测（`--internal-probe-vaapi`）：既避免在主进程加载 libLLVM/Mesa，
+    // 又保证"编了 vaapi 但本机无可用设备"时启动期转码目标与真实播放路径一致。
+    let probed = crate::compat::detect_consumer();
     crate::compat::DecodeConsumer::for_playback(
         cfg!(feature = "vaapi"),
         vaapi_setting_enabled_in(config),
@@ -442,7 +440,11 @@ impl TransitionSettings {
     }
 }
 
-/// 当前显示内容（静态图不常驻 4K 像素副本，转场或重建时按需重渲染）。
+/// 当前显示内容。
+///
+/// 取舍：静态图显示完成后主动释放 `frame`（置为 `None`），不在守护进程常驻内存中保留
+/// 4K RGBA 像素副本（每屏 ~33 MiB）；代价是转场或断线重建时需按需重解码上一张静态图，
+/// 以换取更低的常驻 RSS。
 struct CurrentDisplay {
     media: PathBuf,
     frame: Option<CpuFrame>,
@@ -2578,23 +2580,22 @@ impl Runtime {
         if !self.config.performance.preload_next {
             return;
         }
-        let target = self
-            .channels
-            .get(key)
-            .filter(|ch| {
-                !ch.pinned
-                    && !ch.paused
-                    && ch.static_wallpaper.is_none()
-                    && ch.video.is_none()
-                    && ch.paused_video_media.is_none()
-                    && ch
-                        .scheduler
-                        .next_due()
-                        .is_none_or(|due| due.saturating_duration_since(now) <= PRELOAD_LEAD_TIME)
-            })
-            .and_then(|ch| ch.playlist.peek())
-            .filter(|entry| entry.kind == MediaKind::Image)
-            .map(|entry| entry.path.clone());
+        let target =
+            self.channels
+                .get(key)
+                .filter(|ch| {
+                    !ch.pinned
+                        && !ch.paused
+                        && ch.static_wallpaper.is_none()
+                        && ch.video.is_none()
+                        && ch.paused_video_media.is_none()
+                        && ch.scheduler.next_due().is_none_or(|due| {
+                            due.saturating_duration_since(now) <= PRELOAD_LEAD_TIME
+                        })
+                })
+                .and_then(|ch| ch.playlist.peek())
+                .filter(|entry| entry.kind == MediaKind::Image)
+                .map(|entry| entry.path.clone());
         if let Some(path) = target
             && !self.preload.peek(&path)
             && let Some(ch) = self.channels.get_mut(key)
@@ -3328,6 +3329,8 @@ impl Runtime {
     }
 
     /// 断线恢复/自愈/转场时按需获取当前通道帧（`frame: Some` 直接取，否则按静态图重渲染）。
+    ///
+    /// 以切图/恢复时的少量重解码 CPU 与延迟换取平时不常驻整帧像素副本（见 [`CurrentDisplay`]）。
     fn replay_channel_frame(&mut self, key: &str) -> Option<CpuFrame> {
         let (cached, media) = {
             let ch = self.channels.get(key)?;
@@ -5510,12 +5513,7 @@ impl Runtime {
 
     /// 本机解码能力（按需懒探测并缓存）。
     fn hardware_caps(&self) -> crate::compat::HardwareCaps {
-        if let Some(cached) = self
-            .caps
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
+        if let Some(cached) = self.caps.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             return cached;
         }
         let detected = crate::compat::HardwareCaps::detect(self.config.media.transcode_max_width);
