@@ -553,6 +553,8 @@ unsafe extern "C" {
         flags: c_uint,
         descriptor: *mut VaDrmPrimeSurfaceDescriptor,
     ) -> VaStatus;
+    /// 等待硬件解码/后处理完成（导出 DMA-BUF 前必须同步，避免读到未写完的撕裂帧）。
+    pub unsafe fn vaSyncSurface(display: VaDisplay, render_target: VaSurfaceId) -> VaStatus;
 
     // libavformat
     /// 打开输入。

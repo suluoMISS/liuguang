@@ -188,20 +188,36 @@ fn parse_groups_line(status_text: &str) -> Vec<u32> {
         .unwrap_or_default()
 }
 
-/// 读取对端补充组（best-effort，失败返回空）。
-fn peer_supplementary_gids(pid: i32) -> Vec<u32> {
+fn parse_uid_line(status: &str) -> Option<u32> {
+    status.lines().find_map(|line| {
+        let rest = line.strip_prefix("Uid:")?;
+        rest.split_whitespace().next()?.parse().ok()
+    })
+}
+
+/// 读取对端补充组；若 `/proc/<pid>/status` 已属别的 UID（PID 复用竞态），拒绝授权。
+fn peer_supplementary_gids(pid: i32, expected_uid: u32) -> Result<Vec<u32>, String> {
     if pid <= 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     match std::fs::read_to_string(format!("/proc/{pid}/status")) {
-        Ok(text) => parse_groups_line(&text),
+        Ok(text) => {
+            if let Some(status_uid) = parse_uid_line(&text)
+                && status_uid != expected_uid
+            {
+                return Err(format!(
+                    "对端 PID {pid} 的 UID 已变更为 {status_uid}（期望 {expected_uid}）"
+                ));
+            }
+            Ok(parse_groups_line(&text))
+        }
         Err(e) => {
             tracing::debug!(
                 pid,
                 error = %e,
                 "无法读取对端 /proc/<pid>/status，补充组判定退化为仅主组"
             );
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 }
@@ -212,11 +228,12 @@ fn read_peer_id(stream: &UnixStream) -> Result<PeerId, String> {
     let cred = getsockopt(stream, PeerCredentials)
         .map_err(|e| format!("无法读取 peer credential: {e}"))?;
     let pid = cred.pid();
+    let uid = cred.uid();
     Ok(PeerId {
-        uid: cred.uid(),
+        uid,
         gid: cred.gid(),
         pid,
-        supplementary_gids: peer_supplementary_gids(pid),
+        supplementary_gids: peer_supplementary_gids(pid, uid)?,
     })
 }
 
@@ -295,7 +312,15 @@ impl IpcServer {
     /// 路径被占用、目录不可写或权限设置失败时返回 [`IpcError`]。
     pub fn bind(config: ServerConfig) -> Result<Self, IpcError> {
         let path = &config.socket_path;
-        if path.exists() {
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            use std::os::unix::fs::FileTypeExt as _;
+            if !meta.file_type().is_socket() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("路径已存在且不是 Unix socket，拒绝清理: {}", path.display()),
+                )
+                .into());
+            }
             // 陈旧 socket：能连上说明有实例在跑，拒绝；连不上则清理。
             match UnixStream::connect(path) {
                 Ok(_) => return Err(IpcError::AlreadyBound(path.clone())),
@@ -542,6 +567,7 @@ fn handle_connection<H: RequestHandler>(
 ) {
     if let Err(reason) = peer_allowed(&stream, policy) {
         tracing::warn!(reason = %reason, "拒绝未授权连接（peer credential）");
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
         let resp = Response::err(
             "",
             ErrorBody::new(ErrorKind::PermissionDenied, format!("权限不足：{reason}")),
@@ -549,6 +575,7 @@ fn handle_connection<H: RequestHandler>(
         let _ = write_message(&mut stream, &resp);
         return;
     }
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
     let mut decoder = NdjsonDecoder::new();
     let mut buf = [0u8; 4096];
@@ -590,6 +617,7 @@ fn handle_connection<H: RequestHandler>(
                                     }
                                 }
                                 LineOutcome::Ready(req) => {
+                                    let req_id = req.id.clone();
                                     match dispatch(req, handler) {
                                         Dispatch::Reply(resp) => {
                                             if write_message(&mut stream, &resp).is_err() {
@@ -599,11 +627,11 @@ fn handle_connection<H: RequestHandler>(
                                         Dispatch::Deferred { rx } => {
                                             // 后台任务完成前只占住本连接线程（不占运行时锁）。
                                             // 超时兜底：宁可给一条明确错误，也不让客户端干等。
-                                            let resp = match rx.recv_timeout(DEFERRED_TIMEOUT) {
+                                            let mut resp = match rx.recv_timeout(DEFERRED_TIMEOUT) {
                                                 Ok(resp) => resp,
                                                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                                                     Response::err(
-                                                        "",
+                                                        &req_id,
                                                         ErrorBody::new(
                                                             ErrorKind::Internal,
                                                             format!(
@@ -616,13 +644,14 @@ fn handle_connection<H: RequestHandler>(
                                                 Err(
                                                     std::sync::mpsc::RecvTimeoutError::Disconnected,
                                                 ) => Response::err(
-                                                    "",
+                                                    &req_id,
                                                     ErrorBody::new(
                                                         ErrorKind::Internal,
                                                         "后台任务已被丢弃（服务正在退出）",
                                                     ),
                                                 ),
                                             };
+                                            ensure_request_id(&mut resp, &req_id);
                                             if write_message(&mut stream, &resp).is_err() {
                                                 return;
                                             }

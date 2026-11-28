@@ -325,23 +325,33 @@ fn video_policy(config: &Config) -> liuguang_media::gstreamer::DecoderPolicy {
 /// 事件广播总线（`subscribe` 订阅者注册表）。
 #[derive(Clone, Default)]
 pub struct EventBus {
-    subscribers: Arc<Mutex<Vec<Sender<EventMessage>>>>,
+    subscribers: Arc<Mutex<Vec<std::sync::mpsc::SyncSender<EventMessage>>>>,
 }
 
 impl EventBus {
-    /// 注册订阅者；返回发送端（服务器侧持有接收端推送）。
+    /// 每个订阅者队列上限（防止慢/卡死订阅端触发无界内存增长 OOM）。
+    const SUBSCRIBER_QUEUE_CAP: usize = 128;
+
+    /// 注册订阅者；返回有界队列接收端（服务器侧持有接收端推送）。
     pub fn subscribe(&self) -> Receiver<EventMessage> {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(Self::SUBSCRIBER_QUEUE_CAP);
         if let Ok(mut subs) = self.subscribers.lock() {
             subs.push(tx);
         }
         rx
     }
 
-    /// 广播事件；发送失败（连接已断）的订阅者被移除。
+    /// 广播事件；连接断开或积压超限（慢消费者）的订阅者会被移除。
     pub fn publish(&self, event: EventMessage) {
         if let Ok(mut subs) = self.subscribers.lock() {
-            subs.retain(|tx| tx.send(event.clone()).is_ok());
+            subs.retain(|tx| match tx.try_send(event.clone()) {
+                Ok(()) => true,
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    tracing::warn!("事件订阅队列已满，断开滞后订阅连接");
+                    false
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+            });
         }
     }
 }
@@ -2169,6 +2179,8 @@ impl Runtime {
         if let Some(previous) = self.last_tick_at {
             let gap = now.saturating_duration_since(previous);
             if gap > TICK_GAP_RESET {
+                #[cfg(feature = "vaapi")]
+                liuguang_vaapi::forget_all_devices();
                 for (key, ch) in &mut self.channels {
                     if ch.current.is_some() || ch.video.is_some() {
                         ch.reset_stall_watchdog(now);
@@ -2292,12 +2304,68 @@ impl Runtime {
         plan.deadline(idle)
     }
 
+    /// 移除单个已断开输出的运行时通道与暂停记录，空通道时清空预加载并触发 OutputLost。
+    fn disconnect_channel(&mut self, key: String) {
+        if self.channels.remove(&key).is_none() {
+            return;
+        }
+        tracing::warn!(output = %key, "显示器断开");
+        self.user_paused.remove(&key);
+        self.fullscreen_paused.remove(&key);
+        self.screen_paused.remove(&key);
+        self.game_paused.remove(&key);
+        self.gpu_paused.remove(&key);
+        self.battery_paused.remove(&key);
+        self.pending_sets.retain(|p| p.output != key);
+        self.events.publish(
+            EventMessage::new(EventKind::OutputChanged)
+                .with_output(key)
+                .with_connected(false)
+                .with_message("disconnected"),
+        );
+        if self.channels.is_empty() {
+            self.preload.clear();
+            self.preload_stamps.clear();
+            self.drive(Event::OutputLost);
+        } else {
+            self.sync_top_level_pause_state();
+        }
+    }
+
+    fn handle_backend_disconnect(&mut self) {
+        tracing::warn!(backend = %self.backend_name, "显示后端连接已断开，清理通道等待重连");
+        let keys: Vec<String> = self.channels.keys().cloned().collect();
+        for key in keys {
+            self.disconnect_channel(key);
+        }
+        self.backend_available = false;
+        self.preload.clear();
+        self.preload_stamps.clear();
+        if self.channels.is_empty() && self.state.current() != State::HeadlessReady {
+            self.drive(Event::OutputLost);
+        }
+    }
+
     /// 连接器插拔处理（每 5 次 tick 调用一次）。
     pub fn check_connectors(&mut self) {
         if !self.backend_available {
             return;
         }
+        if !self.backend.is_alive() {
+            self.handle_backend_disconnect();
+            return;
+        }
         let outputs = self.backend.outputs();
+        if !self.backend.is_alive() {
+            self.handle_backend_disconnect();
+            return;
+        }
+        let existing_keys: Vec<String> = self.channels.keys().cloned().collect();
+        for key in existing_keys {
+            if !outputs.iter().any(|o| o.id.as_str() == key) {
+                self.disconnect_channel(key);
+            }
+        }
         for info in &outputs {
             let key = info.id.as_str().to_string();
             match self.backend.connector_connected(&key) {
@@ -2327,32 +2395,7 @@ impl Runtime {
                 }
                 Ok(false) => {
                     if self.channels.contains_key(&key) {
-                        tracing::warn!(output = %key, "显示器断开");
-                        self.channels.remove(&key);
-                        self.user_paused.remove(&key);
-                        self.fullscreen_paused.remove(&key);
-                        self.screen_paused.remove(&key);
-                        self.game_paused.remove(&key);
-                        self.gpu_paused.remove(&key);
-                        self.battery_paused.remove(&key);
-                        self.pending_sets.retain(|p| p.output != key);
-                        self.events.publish(
-                            EventMessage::new(EventKind::OutputChanged)
-                                .with_output(key)
-                                .with_connected(false)
-                                .with_message("disconnected"),
-                        );
-                        if self.channels.is_empty() {
-                            // §11.2「HDMI/DP 拔除 ⇒ 关闭对应输出流与缓存」：
-                            // 最后一块屏没了 ⇒ 缓存里的解码帧已无去处，释放 RSS。
-                            // **部分**拔除不清（同一张图可能正被另一路用着），
-                            // 那条通道自己的预加载目标随通道一起消失。
-                            self.preload.clear();
-                            self.preload_stamps.clear();
-                            self.drive(Event::OutputLost);
-                        } else {
-                            self.sync_top_level_pause_state();
-                        }
+                        self.disconnect_channel(key);
                     }
                 }
                 Err(e) => tracing::warn!(output = %key, error = %e, "连接器状态复查失败"),
@@ -2838,6 +2881,13 @@ impl Runtime {
                                     return self
                                         .latch_dmabuf_rejection(key, &e.message, video_next);
                                 }
+                                if e.detail_code.as_deref() == Some(THROTTLED_CODE) {
+                                    // 合成器遮挡/限流：重置看门狗基线，不把遮挡当停摆。
+                                    if let Some(ch) = self.channels.get_mut(key) {
+                                        ch.last_presented_at = now;
+                                        ch.stall_reported = false;
+                                    }
+                                }
                             }
                             // 显示层对账（t18 API）：**只在 present 返回 Ok 时查** ——
                             // `present_failures` 统计"返回 Err"，`drm_commit_failed` 统计
@@ -3026,6 +3076,8 @@ impl Runtime {
                 } else if matches!(e, liuguang_display::DisplayError::MasterUnavailable { .. }) {
                     // **可重试的环境错误**：调用方据此跳过失败计数（t94）。
                     body.with_detail_code(MASTER_UNAVAILABLE_CODE)
+                } else if matches!(e, liuguang_display::DisplayError::Throttled { .. }) {
+                    body.with_detail_code(THROTTLED_CODE)
                 } else {
                     body
                 }
@@ -3750,13 +3802,17 @@ impl Runtime {
             .video_dmabuf_rgb
             .trim()
             .eq_ignore_ascii_case("never");
-        let needs_rgb = needs_rgb_conversion(&self.config.media.video_dmabuf_rgb)
-            || (!force_never_rgb && transform_needs_rgb);
+        let backend_compositor = self.backend.compositor_name();
+        let needs_rgb = needs_rgb_conversion_with(
+            &self.config.media.video_dmabuf_rgb,
+            backend_compositor.as_deref(),
+        ) || (!force_never_rgb && transform_needs_rgb);
         if needs_rgb {
-            let compositor = crate::compositor_profile::detect_names()
-                .into_iter()
-                .collect::<Vec<_>>()
-                .join(",");
+            let compositor =
+                crate::compositor_profile::detect_names_with_backend(backend_compositor.as_deref())
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(",");
             tracing::info!(
                 output = %key,
                 compositor = %compositor,
@@ -3776,10 +3832,19 @@ impl Runtime {
             // `render_nodes()` 只按名字排序，会稳定地先试 `renderD128`——那可能是
             // 没接显示器的 iGPU。跨 GPU 导入在 4K60 下只剩 20fps（同卡 58fps），
             // 所以优先试**显示 GPU** 的节点；判别不了时顺序原样返回。
-            liuguang_vaapi::render_nodes_preferring_display()
+            let mut list: Vec<PathBuf> = liuguang_vaapi::render_nodes_preferring_display()
                 .into_iter()
                 .map(PathBuf::from)
-                .collect()
+                .collect();
+            if let Some(backend_pref) = self.backend.preferred_render_node() {
+                if let Some(pos) = list.iter().position(|n| n == &backend_pref) {
+                    if pos > 0 {
+                        let node = list.remove(pos);
+                        list.insert(0, node);
+                    }
+                }
+            }
+            list
         };
         if !forced_node
             && let Some((verified_node, verified_rgb)) = self.vaapi_verified_node.as_ref()
@@ -3964,6 +4029,10 @@ impl Runtime {
                 // EACCES。旧实现把它当普通提交失败累计 ⇒ 3 帧就降级成静态图，
                 // 用户看到的是"卡住"（而 master 几秒后就自愈了）。
                 // 这里按**可重试的环境错误**处理：只记专门计数，不计失败、不收敛。
+                if e.detail_code.as_deref() == Some(THROTTLED_CODE) {
+                    tracing::trace!(output = %key, what, error = %e.message, "显示输出被合成器节流，跳过本帧");
+                    return None;
+                }
                 if e.detail_code.as_deref() == Some(MASTER_UNAVAILABLE_CODE) {
                     let skips = match self.channels.get_mut(key) {
                         Some(ch) => {
@@ -7771,7 +7840,7 @@ impl Runtime {
             }
         }
         self.fullscreen_verify_due = Some(now + Self::FULLSCREEN_VERIFY);
-        let probe = crate::fullscreen_probe::probe(toplevel);
+        let probe = crate::fullscreen_probe::probe_nonblocking(toplevel);
         match probe {
             crate::fullscreen_probe::Probe::StillFullscreen => {
                 tracing::trace!(window = %toplevel.describe(), "兜底探测：仍然全屏");
@@ -7860,7 +7929,22 @@ impl Runtime {
 
         let described = toplevel.describe();
         if self.fullscreen_suppressed.as_deref() == Some(described.as_str()) {
-            return;
+            // 定期重探被抑制的窗口：若用户再次把它全屏（而合成器未清状态），解除抑制。
+            if crate::fullscreen_probe::available()
+                && self.fullscreen_verify_due.is_none_or(|due| now >= due)
+            {
+                self.fullscreen_verify_due = Some(now + Self::FULLSCREEN_VERIFY);
+                if crate::fullscreen_probe::probe_nonblocking(&toplevel)
+                    == crate::fullscreen_probe::Probe::StillFullscreen
+                {
+                    tracing::debug!(window = %described, "原抑制窗口重新进入全屏，恢复全屏暂停判断");
+                    self.fullscreen_suppressed = None;
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            }
         }
         if self.fullscreen_suppressed.is_some() {
             self.fullscreen_suppressed = None;
@@ -8145,15 +8229,40 @@ fn err_response_code(id: String, kind: ErrorKind, detail_code: &str, message: &s
 }
 
 fn save_state_file(path: &Path, state: &PersistedState) -> Result<(), String> {
+    use std::io::Write as _;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
     }
     let json = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "state.json".to_string());
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
+    let write_res = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    Ok(())
 }
 
 fn load_state(path: &Path) -> Option<PersistedState> {
@@ -8272,6 +8381,9 @@ const DMABUF_REJECTED_CODE: &str = "DMABUF_REJECTED";
 /// **环境暂时不可用**（旧进程还没释放 master、VT 切换中等），不是帧/平面的
 /// 问题 ⇒ daemon **不把它计入提交失败、不降级**，master 取回后帧泵自动续上。
 const MASTER_UNAVAILABLE_CODE: &str = "MASTER_UNAVAILABLE";
+
+/// 合成器遮挡或限流未发 `frame` 回调时的稳定机器码（跳过本帧、不计入失败/停摆）。
+const THROTTLED_CODE: &str = "DISPLAY_THROTTLED";
 
 /// DMA-BUF 被拒后，等待新（CPU）管线投产的重探间隔。
 const VIDEO_DMABUF_LATCH_REPOLL: Duration = Duration::from_millis(20);
@@ -8436,8 +8548,10 @@ fn parse_transition_direction(name: &str) -> Option<liuguang_core::config::Trans
 /// 前者是配置（auto/always/never），后者只给临时排查用。
 /// 写成纯函数是为了能在没有图形会话的 CI 里测。
 #[cfg(feature = "vaapi")]
-fn needs_rgb_conversion(setting: &str) -> bool {
-    use crate::compositor_profile::{RgbConversion, detect_names, needs_rgb_conversion as decide};
+fn needs_rgb_conversion_with(setting: &str, backend_name: Option<&str>) -> bool {
+    use crate::compositor_profile::{
+        RgbConversion, detect_names_with_backend, needs_rgb_conversion as decide,
+    };
 
     let forced = std::env::var("LIUGUANG_DMABUF_RGB")
         .ok()
@@ -8445,7 +8559,12 @@ fn needs_rgb_conversion(setting: &str) -> bool {
         .and_then(|value| RgbConversion::parse(&value))
         .or_else(|| RgbConversion::parse(setting))
         .unwrap_or(RgbConversion::Auto);
-    decide(&detect_names(), forced)
+    decide(&detect_names_with_backend(backend_name), forced)
+}
+
+#[cfg(all(feature = "vaapi", test))]
+fn needs_rgb_conversion(setting: &str) -> bool {
+    needs_rgb_conversion_with(setting, None)
 }
 
 fn media_kind_for_path(path: &Path) -> MediaKind {

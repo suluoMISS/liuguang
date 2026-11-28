@@ -229,6 +229,12 @@ pub enum DisplayError {
         /// 具体原因（含内核 errno 语义/占用者诊断）。
         detail: String,
     },
+    /// 合成器当前节流或遮挡表面（未返回 `wl_surface.frame` 回调）：调用方应跳过本帧且不计为错误。
+    #[error("显示输出被合成器节流（{reason}）")]
+    Throttled {
+        /// 节流/遮挡原因。
+        reason: String,
+    },
     /// 其他显示操作失败（`operation` 为操作名，如 `present`）。
     #[error("显示操作 {operation} 失败: {message}")]
     Failed {
@@ -444,6 +450,22 @@ pub trait DisplayBackend {
     /// `master == Some(false)` 表示**已确定**本进程不是 master ⇒ 任何提交都不会生效、
     /// 画面不会更新（见 [`crate::master`]）。上层应把它并入 `status`。
     fn master_status(&self) -> Option<&MasterStatus> {
+        None
+    }
+
+    /// 后端连接是否仍然存活（Wayland 断开后返回 `false`，触发上层重连）。
+    fn is_alive(&self) -> bool {
+        true
+    }
+
+    /// 若显示后端或合成器报告了主渲染设备节点（如 DMA-BUF v4 `main_device`），
+    /// 返回对应的 `/dev/dri/renderD*`。
+    fn preferred_render_node(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// 若显示后端可通过 socket peer 等方式识别当前合成器进程名，返回小写名。
+    fn compositor_name(&self) -> Option<String> {
         None
     }
 }

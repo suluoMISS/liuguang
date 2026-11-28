@@ -78,6 +78,29 @@ pub fn needs_rgb_conversion(names: &BTreeSet<String>, forced: RgbConversion) -> 
     }
 }
 
+/// 从进程环境（含 WM socket 变量）与后端探测名识别合成器名字集合（已小写规范化）。
+pub fn detect_names_with_backend(backend_name: Option<&str>) -> BTreeSet<String> {
+    let mut out = detect_names();
+    if let Some(name) = backend_name {
+        for part in name.split(':') {
+            let clean = part.trim().to_ascii_lowercase();
+            if !clean.is_empty() {
+                out.insert(clean);
+            }
+        }
+    }
+    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
+        out.insert("hyprland".to_string());
+    }
+    if std::env::var_os("SWAYSOCK").is_some() {
+        out.insert("sway".to_string());
+    }
+    if std::env::var_os("NIRI_SOCKET").is_some() {
+        out.insert("niri".to_string());
+    }
+    out
+}
+
 /// 从进程环境读合成器名字集合（三个 XDG 变量 + `XDG_SESSION_TYPE` 不参与）。
 pub fn detect_names() -> BTreeSet<String> {
     let values = [

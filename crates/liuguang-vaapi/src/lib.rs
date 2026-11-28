@@ -34,7 +34,7 @@ mod ffi;
 pub mod producer;
 
 pub use convert::RgbConverter;
-pub use decoder::{DecodedSurface, StreamInfo, VaapiDecoder};
+pub use decoder::{DecodedSurface, StreamInfo, VaapiDecoder, forget_all_devices, forget_device};
 pub use device::VaDevice;
 pub use export::{ExportedPlane, ExportedSurface, export_surface};
 pub use producer::VaapiProducer;

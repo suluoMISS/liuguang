@@ -214,16 +214,28 @@ fn rgba_to_rgba8(
     width: i32,
     height: i32,
 ) -> Option<Vec<u8>> {
-    let w = usize::try_from(width).ok()?;
-    let h = usize::try_from(height).ok()?;
-    if w == 0 || h == 0 || data.len() < rowstride * h {
+    if channels != 3 && channels != 4 {
         return None;
     }
-    let mut out = Vec::with_capacity(w * h * 4);
+    let w = usize::try_from(width).ok()?;
+    let h = usize::try_from(height).ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let min_row = w.checked_mul(channels)?;
+    if rowstride < min_row {
+        return None;
+    }
+    let needed = rowstride.checked_mul(h - 1)?.checked_add(min_row)?;
+    if data.len() < needed {
+        return None;
+    }
+    let out_cap = w.checked_mul(h)?.checked_mul(4)?;
+    let mut out = Vec::with_capacity(out_cap);
     for y in 0..h {
-        let row = &data[y * rowstride..];
-        for x in 0..w {
-            let px = &row[x * channels..];
+        let row_start = y * rowstride;
+        let row = &data[row_start..row_start + min_row];
+        for px in row.chunks_exact(channels) {
             match channels {
                 4 => out.extend_from_slice(&px[..4]),
                 3 => out.extend_from_slice(&[px[0], px[1], px[2], 0xFF]),
@@ -251,6 +263,29 @@ mod tests {
         let thumb = decode_png_b64("/m/a.png@0", ONE_PX).expect("1x1 PNG 应能解码");
         assert_eq!((thumb.width, thumb.height), (1, 1));
         assert_eq!(thumb.rgba.len(), 4);
+    }
+
+    #[test]
+    fn rgba_to_rgba8_validates_stride_channels_and_tight_last_row() {
+        // 末行不带尾部填充的 2x2 RGB24：前一行 stride=8，第二行紧贴 6 字节。
+        let buf = [1, 2, 3, 4, 5, 6, 0, 0, 7, 8, 9, 10, 11, 12];
+        let out = rgba_to_rgba8(&buf, 3, 8, 2, 2).expect("紧致末行应成功");
+        assert_eq!(
+            out,
+            vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255]
+        );
+        assert!(
+            rgba_to_rgba8(&buf, 3, 5, 2, 2).is_none(),
+            "过小行距必须拒绝"
+        );
+        assert!(
+            rgba_to_rgba8(&buf, 2, 8, 2, 2).is_none(),
+            "不支持通道数必须拒绝"
+        );
+        assert!(
+            rgba_to_rgba8(&buf, 4, i32::MAX as usize, i32::MAX, i32::MAX).is_none(),
+            "乘法溢出必须拒绝"
+        );
     }
 
     #[test]

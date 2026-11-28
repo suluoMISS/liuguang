@@ -35,15 +35,17 @@ options=('!lto')
 _srcroot="$startdir/../.."
 
 depends=(
-  'wayland'        # libwayland-client
+  'wayland'            # libwayland-client
   'libdrm'
-  'gstreamer'      # 库
+  'gstreamer'          # 库
   'gst-plugins-base'
   'gst-plugins-good'
-  'gst-libav'      # 回退路径的软件解码（avdec_h264）
-  'ffmpeg'         # vaapi feature 链接 libavcodec/libavformat/libavutil
+  'gst-plugins-bad-libs' # GStreamer allocators/va 共享库
+  'gst-libav'          # 回退路径的软件解码（avdec_h264）
+  'ffmpeg'             # vaapi feature 链接 libavcodec/libavformat/libavutil
   'libva'
 )
+backup=('etc/liuguang/config.toml')
 makedepends=(
   'cargo'
   'rust'

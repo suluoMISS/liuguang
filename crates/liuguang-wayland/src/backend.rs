@@ -172,11 +172,9 @@ impl WaylandBackend {
             tracing::debug!("分数缩放协议可用（wp_fractional_scale_v1 + wp_viewport）");
         }
 
-        // 零拷贝（可选）：zwp_linux_dmabuf_v1。只绑到 v3 —— v4+ 把格式广播换成
-        // 需要主动 `get_default_feedback` 的 feedback 对象，本后端没有实现那套
-        // tranche 解析；绑 v3 时合成器必须按旧语义发 `format` + `modifier` 事件。
+        // 零拷贝（可选）：zwp_linux_dmabuf_v1，支持 v1..=3 旧格式事件及 v4 feedback 对象。
         let dmabuf_global: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1> =
-            match globals.bind::<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, WlState, _>(&qh, 1..=3, ())
+            match globals.bind::<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, WlState, _>(&qh, 1..=4, ())
             {
                 Ok(v) => {
                     tracing::debug!("zwp_linux_dmabuf_v1 可用（版本 {}）", v.version());
@@ -189,19 +187,10 @@ impl WaylandBackend {
                     None
                 }
             };
-        let dmabuf_present = dmabuf_global.is_some();
-        wl.dmabuf = dmabuf_global;
-        if dmabuf_present {
-            // 一屏日志换一次「到底支持什么」的确定性：格式/modifier 组合是本后端
-            // 唯一会**静默拒绝**零拷贝的判据，运维排障必须能直接看到。
-            for f in &wl.dmabuf_formats {
-                tracing::debug!(
-                    fourcc = format_args!("0x{:08X}", f.fourcc),
-                    modifiers = ?f.modifiers.iter().map(|m| format!("0x{m:016X}")).collect::<Vec<_>>(),
-                    "合成器广播的 DMA-BUF 格式"
-                );
-            }
+        if let Some(dmabuf) = dmabuf_global.as_ref().filter(|v| v.version() >= 4) {
+            wl.dmabuf_feedback = Some(dmabuf.get_default_feedback(&qh, ()));
         }
+        wl.dmabuf = dmabuf_global;
 
         // 顶层窗口列表（可选）：zwlr_foreign_toplevel_management_unstable_v1。
         // 用来判断"有没有游戏/播放器全屏"，从而暂停壁纸。niri/sway/wlroots 系
@@ -231,32 +220,29 @@ impl WaylandBackend {
             }
             let output: wl_output::WlOutput =
                 registry.bind(g.name, g.version.min(4), &qh, OutputUdata(g.name));
-            wl.outputs.insert(
-                g.name,
-                OutputEntry {
-                    global: g.name,
-                    output,
-                    name: None,
-                    description: None,
-                    physical_mm: None,
-                    scale: 1,
-                    modes: Vec::new(),
-                    current_mode: None,
-                    preferred_mode: None,
-                    surface: None,
-                    layer: None,
-                    viewport: None,
-                    fractional: None,
-                    fractional_factor: None,
-                    cfg: None,
-                    pending_configure: None,
-                    pool: None,
-                    frame_pool: None,
-                    frame_pending: false,
-                    sequence: 0,
-                    dead: false,
-                },
-            );
+            wl.outputs.insert(g.name, OutputEntry::new(g.name, output));
+        }
+
+        let _ = conn.flush();
+        let mut queue = queue;
+        if let Err(e) = queue.roundtrip(&mut wl) {
+            return Err(DisplayError::DeviceUnavailable(format!(
+                "Wayland 初始 roundtrip 失败: {e}"
+            )));
+        }
+
+        if wl.dmabuf.is_some() {
+            // roundtrip 之后再记录格式：v3 modifier 事件和 v4 feedback 均已到达。
+            for f in &wl.dmabuf_formats {
+                tracing::debug!(
+                    fourcc = format_args!("0x{:08X}", f.fourcc),
+                    modifiers = ?f.modifiers.iter().map(|m| format!("0x{m:016X}")).collect::<Vec<_>>(),
+                    "合成器广播的 DMA-BUF 格式"
+                );
+            }
+            if let Some(dev) = wl.dmabuf_main_device.as_ref() {
+                tracing::debug!(node = %dev.display(), "DMA-BUF v4 报告主渲染设备");
+            }
         }
 
         let backend = Self {
@@ -267,8 +253,13 @@ impl WaylandBackend {
             wl: RefCell::new(wl),
         };
 
-        // 泵到安静：收集 wl_output 的 Geometry/Mode/Scale/Name 事件。
-        backend.pump_until(Instant::now() + INIT_CONFIGURE_WAIT);
+        if !backend.wl.borrow().outputs.is_empty() {
+            backend.pump_until_with(Instant::now() + Duration::from_millis(200), |wl| {
+                wl.outputs
+                    .values()
+                    .all(|e| e.done || e.current_mode.is_some())
+            });
+        }
 
         if backend.wl.borrow().exited {
             return Err(DisplayError::DeviceUnavailable(
@@ -281,10 +272,21 @@ impl WaylandBackend {
             ));
         }
 
-        // 给每个活输出建 Background layer surface。
+        // 给每个活输出建 Background layer surface，并等待首次 configure。
         backend.ensure_layer_surfaces();
-        // 泵至全部 configure 到达并 ack + 建池。
-        backend.pump_until(Instant::now() + INIT_CONFIGURE_WAIT);
+        {
+            let mut queue = backend.queue.borrow_mut();
+            let mut wl = backend.wl.borrow_mut();
+            if queue.roundtrip(&mut *wl).is_err() {
+                wl.exited = true;
+            }
+        }
+        backend.pump_until_with(Instant::now() + INIT_CONFIGURE_WAIT, |wl| {
+            wl.outputs
+                .values()
+                .filter(|e| !e.dead)
+                .all(|e| e.cfg.is_some() || e.pending_configure.is_some())
+        });
         backend.apply_configures();
         Ok(backend)
     }
@@ -345,7 +347,11 @@ impl WaylandBackend {
             // 无待处理事件：prepare_read → poll fd → read → 回到循环顶部。
             if let Some(guard) = self.conn.prepare_read() {
                 let remaining = deadline.saturating_duration_since(now);
-                let timeout_ms = remaining.as_millis().min(1000) as i32;
+                let timeout_ms = if remaining.is_zero() {
+                    0
+                } else {
+                    remaining.as_millis().clamp(1, 1000) as i32
+                };
                 if sys::poll_readable(guard.connection_fd().as_raw_fd(), timeout_ms) {
                     if let Err(err) = guard.read() {
                         let would_block = matches!(
@@ -383,15 +389,20 @@ impl WaylandBackend {
                         layer.ack_configure(serial);
                     }
                 }
+                if entry.cfg != Some((cfg_w, cfg_h)) {
+                    entry.needs_repaint = true;
+                }
                 entry.cfg = Some((cfg_w, cfg_h));
                 // viewport 的 destination 是**逻辑**尺寸（surface 坐标）；
-                // buffer 尺寸可以不同（fractional 时 = 逻辑 × 1.5）。
-                if let Some(viewport) = entry.viewport.as_ref() {
-                    if entry.fractional_factor.is_some() && viewport.is_alive() {
-                        viewport.set_destination(
-                            i32::try_from(cfg_w).unwrap_or(i32::MAX),
-                            i32::try_from(cfg_h).unwrap_or(i32::MAX),
-                        );
+                // buffer 尺寸可以不同（fractional 时 = 逻辑 × 1.5）；避免传入 0 触发协议错误。
+                if cfg_w > 0 && cfg_h > 0 {
+                    if let Some(viewport) = entry.viewport.as_ref() {
+                        if entry.fractional_factor.is_some() && viewport.is_alive() {
+                            viewport.set_destination(
+                                i32::try_from(cfg_w).unwrap_or(i32::MAX),
+                                i32::try_from(cfg_h).unwrap_or(i32::MAX),
+                            );
+                        }
                     }
                 }
             }
@@ -405,7 +416,7 @@ impl WaylandBackend {
         }
     }
 
-    /// 给所有无 surface 的活输出建 layer surface（初始 + 热插共用）。
+    /// 给所有无 surface 或被 Closed 标记重建的活输出建 layer surface（初始 + 热插 + Closed 共用）。
     fn ensure_layer_surfaces(&self) {
         let (compositor, shell, viewporter, fractional_manager) = {
             let wl = self.wl.borrow();
@@ -423,15 +434,15 @@ impl WaylandBackend {
         {
             let mut wl = self.wl.borrow_mut();
             for (global, entry) in wl.outputs.iter_mut() {
-                if entry.dead || entry.surface.is_some() {
+                if entry.dead || (entry.surface.is_some() && !entry.needs_recreate) {
                     continue;
                 }
+                entry.needs_recreate = false;
                 let surface = compositor.create_surface(&self.qh, SurfaceUdata(*global));
                 // 壁纸层**绝不能吃掉指针事件**。wl_surface 的 input region 默认是
                 // 整个 surface：一张全屏 layer surface 若不动它，指针落在壁纸上的
                 // 点击会被这层接走。wlroots 会按层排序把事件交给上层，但 Smithay /
-                // denial 的 layer-shell 实现不保证同样的顺序（真机表现：denial 顶栏的
-                // 工作区指示与电池按钮点不动）。显式设成空区域 ⇒ 全部穿透。
+                // denial 的 layer-shell 实现不保证同样的顺序。显式设成空区域 ⇒ 全部穿透。
                 let empty_region = compositor.create_region(&self.qh, ());
                 surface.set_input_region(Some(&empty_region));
                 empty_region.destroy();
@@ -446,20 +457,19 @@ impl WaylandBackend {
                 );
                 // scanner 对 bitfield 枚举生成 camelCase 关联常量。
                 layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+                layer.set_size(0, 0);
                 layer.set_exclusive_zone(-1);
                 layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-                // **必须**：layer surface 的首次 commit 不能带 buffer —— 这是
-                // 触发合成器发 configure 的唯一信号。少了这句就永远收不到
-                // configure，池建不出来，present 会卡在"等待 configure"。
-                surface.commit();
-                // 分数缩放与 viewport 互相独立：只要有 viewporter 就建 viewport，
-                // 避免只有 wp_viewporter、没有 fractional_scale 时 DMA-BUF 与快路径退化。
+                // 必须在首次空 commit 之前创建 viewport 与 fractional_scale 附加对象。
                 entry.viewport = viewporter
                     .as_ref()
                     .map(|vp| vp.get_viewport(&surface, &self.qh, ()));
                 entry.fractional = fractional_manager.as_ref().map(|fs| {
                     fs.get_fractional_scale(&surface, &self.qh, FractionalUdata(*global))
                 });
+                // **必须**：layer surface 的首次 commit 不能带 buffer —— 这是
+                // 触发合成器发 configure 的唯一信号。
+                surface.commit();
                 entry.surface = Some(surface);
                 entry.layer = Some(layer);
                 created = true;
@@ -534,10 +544,13 @@ impl WaylandBackend {
             )
         };
 
-        // 单帧 in-flight 背压：等上一个 frame 回调（超时放行，丢帧不堆积）。
+        // 单帧 in-flight 背压：若合成器未返回上一帧的 frame 回调（表面被遮挡/锁屏），
+        // 直接返回 Throttled 跳过本次提交，避免无限制造并泄漏 wl_callback。
         let pending = |wl: &WlState| wl.outputs.get(&global).is_some_and(|e| e.frame_pending);
         if !self.wait_for(Instant::now() + FRAME_WAIT, |wl| !pending(wl)) {
-            tracing::trace!("wayland frame 背压超时（100ms），放行提交");
+            return Err(DisplayError::Throttled {
+                reason: "合成器未返回 frame 回调（表面被遮挡或限流）".into(),
+            });
         }
 
         // 等待 layer surface 完成首次 configure。
@@ -568,7 +581,7 @@ impl WaylandBackend {
                 {
                     return fp.free_slot().is_some();
                 }
-                return e.pool.as_ref().is_none_or(|p| p.free_slot().is_some());
+                return true;
             }
             match (e.pool.as_ref(), e.buffer_dims()) {
                 (Some(pool), Some(want)) if pool.dims() == want => pool.free_slot().is_some(),
@@ -675,6 +688,7 @@ impl WaylandBackend {
                     })?;
                     entry.pool = Some(created);
                 }
+                let ref_dims = entry.effective_mode_dims().unwrap_or((cfg_w, cfg_h));
                 let pool = entry.pool.as_mut().ok_or_else(|| DisplayError::Failed {
                     operation: "present",
                     message: "wl_shm 池不可用（重建失败？）".into(),
@@ -685,7 +699,16 @@ impl WaylandBackend {
                     operation: "present",
                     message: "wl_shm 空槽竞争丢失（内部不变量破坏）".into(),
                 })?;
-                blit::write_frame(pool.slot_data(slot), stride, pw, ph, &frame, src, dst)?;
+                let scaled_dst = scale_dst_rect(dst, ref_dims, (pw, ph));
+                blit::write_frame(
+                    pool.slot_data(slot),
+                    stride,
+                    pw,
+                    ph,
+                    &frame,
+                    src,
+                    scaled_dst,
+                )?;
                 let buffer = pool
                     .buffer(slot)
                     .cloned()
@@ -708,14 +731,16 @@ impl WaylandBackend {
             if let Some(viewport) = entry.viewport.as_ref().filter(|v| v.is_alive()) {
                 if fast.is_some() {
                     viewport.set_source(sx, sy, sw, sh);
-                    viewport.set_destination(
-                        i32::try_from(cfg_w).unwrap_or(i32::MAX),
-                        i32::try_from(cfg_h).unwrap_or(i32::MAX),
-                    );
+                    if cfg_w > 0 && cfg_h > 0 {
+                        viewport.set_destination(
+                            i32::try_from(cfg_w).unwrap_or(i32::MAX),
+                            i32::try_from(cfg_h).unwrap_or(i32::MAX),
+                        );
+                    }
                 } else {
                     // 切回慢路径时必须清空上一帧残留的 source 裁切（否则 out_of_buffer 断连）。
                     viewport.set_source(-1.0, -1.0, -1.0, -1.0);
-                    if entry.has_fractional_scale() {
+                    if entry.has_fractional_scale() && cfg_w > 0 && cfg_h > 0 {
                         viewport.set_destination(
                             i32::try_from(cfg_w).unwrap_or(i32::MAX),
                             i32::try_from(cfg_h).unwrap_or(i32::MAX),
@@ -730,16 +755,22 @@ impl WaylandBackend {
             } else {
                 entry.buffer_scale()
             };
-            surface.set_buffer_scale(scale);
+            if surface.version() >= 3 {
+                surface.set_buffer_scale(scale);
+            }
             surface.attach(Some(&buffer), 0, 0);
             if surface.version() >= 4 {
                 surface.damage_buffer(0, 0, pw as i32, ph as i32);
             } else {
                 surface.damage(0, 0, cfg_w as i32, cfg_h as i32);
             }
-            let _callback = surface.frame(&qh, FrameUdata(global));
+            entry.frame_gen = entry.frame_gen.wrapping_add(1);
+            let frame_gen = entry.frame_gen;
+            entry.frame_callback =
+                Some((frame_gen, surface.frame(&qh, FrameUdata(global, frame_gen))));
             surface.commit();
             entry.frame_pending = true;
+            entry.needs_repaint = false;
             entry.sequence = entry.sequence.wrapping_add(1);
             entry.sequence
         };
@@ -826,10 +857,12 @@ impl WaylandBackend {
             }
         }
 
-        // 单帧 in-flight 背压（与 CPU 路径同语义：等上一个 frame 回调）。
+        // 单帧 in-flight 背压（与 CPU 路径同语义：遮挡/节流时不盲目提交、不泄漏 wl_callback）。
         let pending = |wl: &WlState| wl.outputs.get(&global).is_some_and(|e| e.frame_pending);
         if !self.wait_for(Instant::now() + FRAME_WAIT, |wl| !pending(wl)) {
-            tracing::trace!("wayland frame 背压超时（100ms），放行 DMA-BUF 提交");
+            return Err(DisplayError::Throttled {
+                reason: "合成器未返回 frame 回调（表面被遮挡或限流）".into(),
+            });
         }
 
         // 等待 layer surface 完成首次 configure（热插拔刚建立的输出需要等一轮事件）。
@@ -894,6 +927,15 @@ impl WaylandBackend {
         // * 其余情况仍走异步 `create` + 等 `created`：`create_immed` 的失败不再是
         //   `failed` 事件，而是**协议错误**（直接断连接），所以第一次必须用能拿到
         //   明确结果的路径验过，才敢走同步路径。
+        let planes = plane_count(&frame);
+        let warm_key = (
+            frame.fourcc,
+            frame.modifier,
+            frame.width,
+            frame.height,
+            planes,
+            frame.object_count(),
+        );
         let (dmabuf, serial, warm) = {
             let mut wl = self.wl.borrow_mut();
             let Some(dmabuf) = wl.dmabuf.clone() else {
@@ -910,22 +952,14 @@ impl WaylandBackend {
                 std::env::var("LIUGUANG_DMABUF_IMMED").as_deref(),
                 Ok("0" | "off" | "false" | "no")
             );
-            let warm = immed_enabled && wl.dmabuf_warm.contains(&(frame.fourcc, frame.modifier));
+            let warm = immed_enabled && wl.dmabuf_warm.contains(&warm_key);
             (dmabuf, serial, warm)
         };
         let qh_handle = self.qh.clone();
         // 寿命延长器：DMA-BUF 的 fd 只是句柄，内存仍归供应商所有。把供应商的
         // 保活对象寄存到 `WlState`，等合成器发 `wl_buffer.release`（即用完这一帧）
         // 再随 buffer 一起释放。
-        //
-        // **两条路的存放位置不同，而且不能都放**：
-        // * 异步 `create` 只有导入序号 ⇒ 放 `dmabuf_keepalives[serial]`；
-        // * `create_immed` 同步拿到 `wl_buffer` ⇒ 放 `dmabuf_buffer_keepalive[buffer.id()]`。
-        // 早期实现先把每帧都塞进 `dmabuf_keepalives[serial]`，immed 分支再塞一份到
-        // buffer 表；release 只清得掉 buffer 表那份，序号表那份成为永久泄漏 ⇒
-        // 表面永不归还、`inflight` 涨到上限后整条供给停摆（真机表现：跑 7 帧就停）。
         let params = dmabuf.create_params(&qh_handle, DmabufParamsUdata(serial));
-        let planes = plane_count(&frame);
         let modifier_hi = (frame.modifier >> 32) as u32;
         let modifier_lo = (frame.modifier & 0xffff_ffff) as u32;
         for plane in 0..planes {
@@ -1014,7 +1048,7 @@ impl WaylandBackend {
             match wl.dmabuf_result.take() {
                 Some((_, Ok(buffer))) => {
                     // 这一组格式被证明能导入 ⇒ 下一帧起走同步路径。
-                    wl.dmabuf_warm.insert((frame.fourcc, frame.modifier));
+                    wl.dmabuf_warm.insert(warm_key);
                     buffer
                 }
                 Some((_, Err(()))) => {
@@ -1065,13 +1099,17 @@ impl WaylandBackend {
             if let Some(viewport) = entry.viewport.as_ref().filter(|v| v.is_alive()) {
                 let (sx, sy, sw, sh) = clamp_viewport_source(src, frame.width, frame.height);
                 viewport.set_source(sx, sy, sw, sh);
-                viewport.set_destination(
-                    i32::try_from(cfg.0).unwrap_or(i32::MAX),
-                    i32::try_from(cfg.1).unwrap_or(i32::MAX),
-                );
+                if cfg.0 > 0 && cfg.1 > 0 {
+                    viewport.set_destination(
+                        i32::try_from(cfg.0).unwrap_or(i32::MAX),
+                        i32::try_from(cfg.1).unwrap_or(i32::MAX),
+                    );
+                }
                 // 有 viewport 时 buffer_scale 必须是 1（否则单位被再除一次）。
-                surface.set_buffer_scale(1);
-            } else {
+                if surface.version() >= 3 {
+                    surface.set_buffer_scale(1);
+                }
+            } else if surface.version() >= 3 {
                 surface.set_buffer_scale(entry.buffer_scale());
             }
             surface.attach(Some(&buffer), 0, 0);
@@ -1085,9 +1123,15 @@ impl WaylandBackend {
                     i32::try_from(cfg.1).unwrap_or(i32::MAX),
                 );
             }
-            let _callback = surface.frame(&qh_handle, FrameUdata(global));
+            entry.frame_gen = entry.frame_gen.wrapping_add(1);
+            let frame_gen = entry.frame_gen;
+            entry.frame_callback = Some((
+                frame_gen,
+                surface.frame(&qh_handle, FrameUdata(global, frame_gen)),
+            ));
             surface.commit();
             entry.frame_pending = true;
+            entry.needs_repaint = false;
             entry.sequence = entry.sequence.wrapping_add(1);
             // DMA-BUF 稳态下合成器已不再持有此前的 CPU 共享内存缓冲时，释放空闲池以收回 memfd 内存。
             if entry
@@ -1106,7 +1150,9 @@ impl WaylandBackend {
                 entry.frame_pool = None;
                 tracing::debug!(output = %global, "DMA-BUF 稳态：已释放空闲帧级 wl_shm 池");
             }
-            entry.sequence
+            let seq = entry.sequence;
+            wl.dmabuf_buffer_output.insert(buffer.id(), global);
+            seq
         };
         let _ = self.conn.flush();
 
@@ -1344,21 +1390,50 @@ impl DisplayBackend for WaylandBackend {
         // 一个 —— 对"要不要暂停"这件事两者等价。
         let mut candidates = wl
             .toplevels
-            .values()
-            .filter(|entry| entry.state.fullscreen && !entry.state.minimized);
+            .iter()
+            .filter(|(_, entry)| entry.state.fullscreen && !entry.state.minimized);
         let chosen = candidates
             .clone()
-            .find(|entry| entry.state.activated)
+            .find(|(_, entry)| entry.state.activated)
             .or_else(|| candidates.next());
-        chosen.map(|entry| FullscreenToplevel {
-            app_id: entry.app_id.clone(),
-            title: entry.title.clone(),
-            outputs: entry.outputs.clone(),
+        chosen.map(|(id, entry)| {
+            let outputs = wl
+                .toplevel_output_ids
+                .get(id)
+                .map(|oids| {
+                    oids.iter()
+                        .filter_map(|oid| wl.output_name_of(oid.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|names| !names.is_empty())
+                .unwrap_or_else(|| entry.outputs.clone());
+            FullscreenToplevel {
+                app_id: entry.app_id.clone(),
+                title: entry.title.clone(),
+                outputs,
+            }
         })
     }
 
     fn commit_stats(&self) -> Option<CommitStats> {
         None
+    }
+
+    fn is_alive(&self) -> bool {
+        self.ensure_alive().is_ok()
+    }
+
+    fn preferred_render_node(&self) -> Option<std::path::PathBuf> {
+        let _ = self.ensure_alive();
+        self.wl.borrow().dmabuf_main_device.clone()
+    }
+
+    fn compositor_name(&self) -> Option<String> {
+        let fd = self.conn.backend().poll_fd().as_raw_fd();
+        let pid = sys::peer_pid(fd)?;
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        let clean = comm.trim().to_ascii_lowercase();
+        (!clean.is_empty()).then_some(clean)
     }
 }
 
@@ -1366,11 +1441,26 @@ impl DisplayBackend for WaylandBackend {
 // rect 归一化 + 单元测试
 // ---------------------------------------------------------------------------
 
+/// 把模式逻辑尺寸里的 `dst` 等比例缩放到实际的缓冲像素尺寸 `(buf_w, buf_h)`（用于分数缩放或旋转）。
+fn scale_dst_rect(dst: DstRect, ref_dims: (u32, u32), buf_dims: (u32, u32)) -> DstRect {
+    let (rw, rh) = ref_dims;
+    let (bw, bh) = buf_dims;
+    if rw == 0 || rh == 0 || bw == 0 || bh == 0 || (rw == bw && rh == bh) {
+        return dst;
+    }
+    let scale_x = |v: i64| ((v as f64) * f64::from(bw) / f64::from(rw)).round() as i64;
+    let scale_y = |v: i64| ((v as f64) * f64::from(bh) / f64::from(rh)).round() as i64;
+    let x = scale_x(dst.0);
+    let y = scale_y(dst.1);
+    let w = (((dst.2 as f64) * f64::from(bw) / f64::from(rw)).round() as u64).max(1);
+    let h = (((dst.3 as f64) * f64::from(bh) / f64::from(rh)).round() as u64).max(1);
+    (x, y, w, h)
+}
+
 /// 判断 `dst`（模式物理像素矩形）是否铺满整张层表面，决定能否走 fast-path/DMA-BUF。
 fn entry_fills_surface(entry: &OutputEntry, dst: DstRect) -> bool {
     let (tw, th) = entry
-        .current_mode
-        .map(|m| (m.width, m.height))
+        .effective_mode_dims()
         .or_else(|| entry.buffer_dims())
         .or(entry.cfg)
         .unwrap_or((0, 0));
@@ -1418,32 +1508,31 @@ impl Drop for WaylandBackend {
         // 代理 Drop 不发 destructor 请求；显式销毁避免合成器端悬挂
         // surface（断开 socket 也会清理，这里只是礼貌收尾）。
         let mut wl = self.wl.borrow_mut();
-        for entry in wl.outputs.values_mut() {
-            if let Some(viewport) = entry.viewport.take() {
-                if viewport.is_alive() {
-                    viewport.destroy();
-                }
-            }
-            if let Some(fractional) = entry.fractional.take() {
-                if fractional.is_alive() {
-                    fractional.destroy();
-                }
-            }
-            if let Some(layer) = entry.layer.take() {
-                if layer.is_alive() {
-                    layer.destroy();
-                }
-            }
-            if let Some(surface) = entry.surface.take() {
-                if surface.is_alive() {
-                    surface.destroy();
-                }
-            }
-            entry.pool = None;
+        for (_, mut entry) in wl.outputs.drain() {
+            super::state::destroy_output_surface_resources(&mut entry);
             if entry.output.is_alive() && entry.output.version() >= 3 {
                 entry.output.release();
             }
         }
+        if let Some(fb) = wl.dmabuf_feedback.take() {
+            if fb.is_alive() {
+                fb.destroy();
+            }
+        }
+        if let Some(dmabuf) = wl.dmabuf.take() {
+            if dmabuf.is_alive() {
+                dmabuf.destroy();
+            }
+        }
+        if let Some(tm) = wl.toplevel_manager.take() {
+            if tm.is_alive() {
+                tm.stop();
+            }
+        }
+        wl.dmabuf_keepalives.clear();
+        wl.dmabuf_buffer_keepalive.clear();
+        wl.dmabuf_buffer_serial.clear();
+        wl.dmabuf_buffer_output.clear();
         let _ = self.conn.flush();
     }
 }
@@ -1755,5 +1844,17 @@ mod tests {
         assert!(w >= 1.0 / 256.0 && h >= 1.0 / 256.0);
         assert!((x * 256.0).round() + (w * 256.0).round() <= 3840.0 * 256.0);
         assert!((y * 256.0).round() + (h * 256.0).round() <= 2160.0 * 256.0);
+    }
+
+    #[test]
+    fn scale_dst_rect_handles_fractional_scaling() {
+        // 模式 2560x1600 -> fractional 1.5 buffer 2561x1601 时 dst 等比例缩放。
+        let scaled = scale_dst_rect((100, 50, 2000, 1200), (2560, 1600), (1280, 800));
+        assert_eq!(scaled, (50, 25, 1000, 600));
+        // 同尺寸直通不变。
+        assert_eq!(
+            scale_dst_rect((10, 20, 300, 400), (1920, 1080), (1920, 1080)),
+            (10, 20, 300, 400)
+        );
     }
 }

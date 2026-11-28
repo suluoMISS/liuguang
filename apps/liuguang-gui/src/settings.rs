@@ -881,6 +881,26 @@ pub fn autostart_enabled() -> bool {
     autostart_path().is_some_and(|path| path.exists())
 }
 
+/// 按 freedesktop Desktop Entry `Exec` 规范转义可执行路径（含空格或特殊字符时加双引号）。
+fn escape_desktop_exec(path: &str) -> String {
+    let needs_quote = path
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '"' | '\\' | '$' | '`'));
+    if !needs_quote {
+        return path.to_owned();
+    }
+    let mut out = String::with_capacity(path.len() + 2);
+    out.push('"');
+    for ch in path.chars() {
+        if matches!(ch, '"' | '\\' | '$' | '`') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
 /// 写/删自启文件。
 pub fn set_autostart(enabled: bool) -> Result<PathBuf, String> {
     let path = autostart_path().ok_or_else(|| "没有 HOME/XDG_CONFIG_HOME".to_owned())?;
@@ -893,10 +913,11 @@ pub fn set_autostart(enabled: bool) -> Result<PathBuf, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let exec = std::env::current_exe()
+    let exec_raw = std::env::current_exe()
         .ok()
         .map(|exe| exe.display().to_string())
         .unwrap_or_else(|| "liuguang-gui".to_owned());
+    let exec = escape_desktop_exec(&exec_raw);
     let content = format!(
         "[Desktop Entry]\nType=Application\nName=流光\nName[zh_CN]=流光\nName[en_US]=Liuguang\nComment=流光 · 动态壁纸库与播放列表\nExec={exec}\nIcon=liuguang\nTerminal=false\nCategories=Graphics;\nX-GNOME-Autostart-enabled=true\n"
     );
@@ -927,6 +948,15 @@ mod tests {
         assert_eq!(rgb_index("always"), 1);
         assert_eq!(rgb_index("never"), 2);
         assert_eq!(RGB_IDS[0], "auto");
+        assert_eq!(
+            escape_desktop_exec("/usr/bin/liuguang-gui"),
+            "/usr/bin/liuguang-gui"
+        );
+        assert_eq!(
+            escape_desktop_exec("/opt/My Apps/liuguang gui"),
+            "\"/opt/My Apps/liuguang gui\""
+        );
+        assert_eq!(escape_desktop_exec("/tmp/a\"b$c"), "\"/tmp/a\\\"b\\$c\"");
     }
 
     #[test]

@@ -104,3 +104,71 @@ pub(crate) fn poll_readable(fd: RawFd, timeout_ms: i32) -> bool {
     let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
     rc > 0 && (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0
 }
+
+/// 读取 `zwp_linux_dmabuf_feedback_v1.format_table` 提供的只读格式表 `(fourcc, modifier)`。
+///
+/// 按协议约定：表项紧致排列、每项 16 字节（u32 format + u32 padding + u64 modifier），
+/// 必须使用 `MAP_PRIVATE | PROT_READ` 只读映射。
+pub(crate) fn read_dmabuf_format_table(fd: RawFd, size: usize) -> io::Result<Vec<(u32, u64)>> {
+    const MAX_FORMAT_TABLE_BYTES: usize = 4 * 1024 * 1024;
+    if size == 0 || size > MAX_FORMAT_TABLE_BYTES || size % 16 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("DMA-BUF format_table 尺寸非法: {size}"),
+        ));
+    }
+    // SAFETY: 调用方持有 fd 所有权，只读 MAP_PRIVATE 映射 size 字节并在返回前检查 MAP_FAILED 与 munmap。
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            fd,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `[ptr, ptr + size)` 为刚刚成功映射的有效只读内存区域，且长度是 16 的整数倍。
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), size) };
+    let mut entries = Vec::with_capacity(size / 16);
+    for chunk in bytes.chunks_exact(16) {
+        let format = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let modifier = u64::from_ne_bytes([
+            chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14], chunk[15],
+        ]);
+        entries.push((format, modifier));
+    }
+    // SAFETY: `ptr/size` 来自上面成功的 `mmap`，只释放一次。
+    unsafe {
+        libc::munmap(ptr, size);
+    }
+    Ok(entries)
+}
+
+/// 通过 Unix socket `SO_PEERCRED` 获取对端合成器进程的 PID。
+pub(crate) fn peer_pid(fd: RawFd) -> Option<u32> {
+    let mut ucred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `ucred` 与 `len` 均为本栈有效变量，传给只读查询选项 `SO_PEERCRED`。
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut ucred).cast(),
+            &raw mut len,
+        )
+    };
+    if rc == 0 && ucred.pid > 0 {
+        u32::try_from(ucred.pid).ok()
+    } else {
+        None
+    }
+}

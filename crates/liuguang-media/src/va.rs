@@ -227,15 +227,57 @@ fn probe_impl() -> VaProbe {
 /// 以指定驱动运行 `vainfo` 并解析能力；`vainfo` 缺失/失败返回 `None`。
 #[cfg(target_os = "linux")]
 fn run_vainfo(driver: Option<&str>) -> Option<VaInfo> {
+    use std::io::Read as _;
     let mut cmd = std::process::Command::new("vainfo");
     match driver {
         Some(name) => cmd.env("LIBVA_DRIVER_NAME", name),
         None => cmd.env_remove("LIBVA_DRIVER_NAME"),
     };
-    let output = cmd.output().ok()?;
-    // vainfo 把能力表写在 stdout，部分诊断信息在 stderr：两路都解析。
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    const MAX_BYTES: u64 = 256 * 1024;
+    let out_reader = child.stdout.take().map(|s| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = s.take(MAX_BYTES).read_to_end(&mut b);
+            b
+        })
+    });
+    let err_reader = child.stderr.take().map(|s| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = s.take(MAX_BYTES).read_to_end(&mut b);
+            b
+        })
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(h) = out_reader {
+                    let _ = h.join();
+                }
+                if let Some(h) = err_reader {
+                    let _ = h.join();
+                }
+                return None;
+            }
+        }
+    }
+    let stdout = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    let mut text = String::from_utf8_lossy(&stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&stderr));
     Some(parse_vainfo(&text))
 }
 

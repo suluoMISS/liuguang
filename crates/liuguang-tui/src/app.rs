@@ -120,9 +120,9 @@ impl<C: Session> App<C> {
         self.needs_render = true;
     }
 
-    /// 时间推进：指标 ≤2 Hz、搜索防抖、应用确认超时。
+    /// 时间推进：指标 ≤2 Hz（在线时）、搜索防抖、仅在有待确认应用时检查超时。
     pub fn tick(&mut self, now: Instant) {
-        if self.metrics_due(now) {
+        if self.state.connection.is_online() && self.metrics_due(now) {
             self.last_metrics = Some(now);
             self.on_action(Action::MetricsTick);
         }
@@ -130,7 +130,12 @@ impl<C: Session> App<C> {
             self.state.search_dirty_at = None;
             self.on_action(Action::SearchDue);
         }
-        self.on_action(Action::ApplyTimeoutCheck);
+        if matches!(
+            self.state.apply_phase,
+            Some(ApplyPhase::Accepted | ApplyPhase::Sending)
+        ) {
+            self.on_action(Action::ApplyTimeoutCheck);
+        }
         self.drain_events();
     }
 
@@ -359,7 +364,10 @@ impl<C: Session> App<C> {
                         self.state.status = s;
                         self.state.connection = Connection::Online;
                     }
-                    Err(e) => self.mark_offline("读取状态", e),
+                    Err(e) => {
+                        self.mark_offline("读取状态", e);
+                        return;
+                    }
                 }
                 match self.client.outputs() {
                     Ok(o) => {
@@ -372,7 +380,10 @@ impl<C: Session> App<C> {
                         }
                         self.state.outputs = o;
                     }
-                    Err(e) => self.mark_offline("枚举输出", e),
+                    Err(e) => {
+                        self.mark_offline("枚举输出", e);
+                        return;
+                    }
                 }
                 match self.client.list_sources() {
                     Ok(s) => {
@@ -890,7 +901,10 @@ impl TerminalGuard {
     pub fn enter() -> Result<Self, TuiError> {
         enable_raw_mode()?;
         let mut stdout = std::io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        if let Err(err) = execute!(stdout, EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
         Ok(Self { restored: false })
     }
 
@@ -998,5 +1012,23 @@ impl<C: Session> App<C> {
     /// 是否请求退出。
     pub fn should_quit(&self) -> bool {
         self.state.quit
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_tick_offline_does_not_mark_dirty() {
+        let mut app = App::new(MockControl::new());
+        app.state.connection = Connection::Offline("offline".into());
+        app.needs_render = false;
+        let now = Instant::now() + Duration::from_secs(10);
+        app.tick(now);
+        assert!(
+            !app.needs_render(),
+            "离线且无 pending apply 时空闲 tick 不得触发每 250ms 重绘"
+        );
     }
 }

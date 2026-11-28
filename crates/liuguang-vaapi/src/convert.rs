@@ -391,10 +391,41 @@ fn output_frame(
 // ---------------------------------------------------------------------------
 
 type EglInstance = egl::DynamicInstance<egl::EGL1_5>;
-type EglCreateImageFn =
+type EglCreateImageKhrFn =
     extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, *const i32) -> *mut c_void;
+type EglCreateImageCoreFn =
+    extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, *const isize) -> *mut c_void;
 type EglDestroyImageFn = extern "system" fn(*mut c_void, *mut c_void) -> u32;
 type EglGetErrorFn = extern "system" fn() -> i32;
+
+const EGL_CONTEXT_LOST_CODE: i32 = 0x300E;
+
+#[derive(Clone, Copy)]
+enum EglCreateImageFn {
+    /// KHR 扩展版本 `eglCreateImageKHR`，属性数组元素为 32 位 `EGLint` (`i32`)。
+    Khr(EglCreateImageKhrFn),
+    /// EGL 1.5 核心版本 `eglCreateImage`，属性数组元素为指针宽度 `EGLAttrib` (`isize`)。
+    Core(EglCreateImageCoreFn),
+}
+
+impl EglCreateImageFn {
+    fn call(
+        self,
+        display: *mut c_void,
+        context: *mut c_void,
+        target: u32,
+        buffer: *mut c_void,
+        attributes: &[i32],
+    ) -> *mut c_void {
+        match self {
+            Self::Khr(func) => func(display, context, target, buffer, attributes.as_ptr()),
+            Self::Core(func) => {
+                let widened: Vec<isize> = attributes.iter().map(|&v| v as isize).collect();
+                func(display, context, target, buffer, widened.as_ptr())
+            }
+        }
+    }
+}
 
 fn init_error(node: &Path, message: impl Into<String>) -> VaapiError {
     VaapiError::Init {
@@ -450,12 +481,16 @@ struct EglRaw {
 
 impl EglRaw {
     fn load(instance: &EglInstance) -> Result<Self, String> {
-        let create_image = match load_symbol::<EglCreateImageFn>(instance, "eglCreateImageKHR") {
-            Ok(symbol) => symbol,
+        let create_image = match load_symbol::<EglCreateImageKhrFn>(instance, "eglCreateImageKHR") {
+            Ok(symbol) => EglCreateImageFn::Khr(symbol),
             Err(khr) => {
-                load_symbol::<EglCreateImageFn>(instance, "eglCreateImage").map_err(|core| {
-                    format!("加载 eglCreateImageKHR 失败（{khr}），eglCreateImage 也失败（{core}）")
-                })?
+                let symbol = load_symbol::<EglCreateImageCoreFn>(instance, "eglCreateImage")
+                    .map_err(|core| {
+                        format!(
+                            "加载 eglCreateImageKHR 失败（{khr}），eglCreateImage 也失败（{core}）"
+                        )
+                    })?;
+                EglCreateImageFn::Core(symbol)
             }
         };
         let destroy_image = match load_symbol::<EglDestroyImageFn>(instance, "eglDestroyImageKHR") {
@@ -477,9 +512,8 @@ impl EglRaw {
         })
     }
 
-    fn error_text(&self) -> String {
-        let code = (self.get_error)();
-        format!("{}（0x{code:04X}）", egl_error_name(code))
+    fn take_error_code(&self) -> i32 {
+        (self.get_error)()
     }
 }
 
@@ -857,7 +891,12 @@ impl Renderer {
     fn acquire(&self) -> Result<(), VaapiError> {
         self.instance
             .make_current(self.display, self.surface, self.surface, Some(self.context))
-            .map_err(|error| self.convert_error(format!("eglMakeCurrent 失败: {error}")))
+            .map_err(|error| {
+                if matches!(error, egl::Error::ContextLost) {
+                    crate::decoder::forget_device(&self.node);
+                }
+                self.convert_error(format!("eglMakeCurrent 失败: {error}"))
+            })
     }
 
     /// 释放 EGL 上下文（失败只打日志：不能让清理路径把播放线程带崩）。
@@ -1055,22 +1094,26 @@ impl Renderer {
         push_plane_attributes(&mut attributes, plane);
         // 属性表以 EGL_NONE 结尾（`push_plane_attributes` 保证），
         // fd 在调用期间有效（借用自输入帧）。
-        let image = (self.raw.create_image)(
+        let image = self.raw.create_image.call(
             self.display.as_ptr(),
             ptr::null_mut(),
             EGL_LINUX_DMA_BUF_EXT,
             ptr::null_mut(),
-            attributes.as_ptr(),
+            &attributes,
         );
         if image.is_null() {
+            let code = self.raw.take_error_code();
+            if code == EGL_CONTEXT_LOST_CODE {
+                crate::decoder::forget_device(&self.node);
+            }
             return Err(self.convert_error(format!(
-                "{}（fourcc=0x{:08X}, {}x{}, modifier={:?}）的 eglCreateImageKHR 返回空: {}",
+                "{}（fourcc=0x{:08X}, {}x{}, modifier={:?}）的 eglCreateImage 返回空: {}（0x{code:04X}）",
                 plane.label,
                 plane.fourcc,
                 plane.width,
                 plane.height,
                 plane.modifier,
-                self.raw.error_text()
+                egl_error_name(code),
             )));
         }
         Ok(EglImage {
@@ -1248,6 +1291,9 @@ impl Renderer {
     fn finish(&self) -> Result<(), VaapiError> {
         (self.gl.finish)();
         if let Some(error) = self.gl.take_error("glFinish") {
+            if self.raw.take_error_code() == EGL_CONTEXT_LOST_CODE {
+                crate::decoder::forget_device(&self.node);
+            }
             return Err(self.convert_error(error));
         }
         Ok(())
@@ -1315,8 +1361,14 @@ fn choose_config(instance: &EglInstance, display: egl::Display) -> Result<egl::C
         egl::NONE,
     ];
     // 拿不到带 pbuffer 的配置时不要直接失败：NVIDIA 恰好支持 surfaceless，
-    // 留一个 SURFACE_TYPE=0 的配置当后备。
-    let surfaceless = [egl::SURFACE_TYPE, 0, egl::NONE];
+    // 保留 RENDERABLE_TYPE=OPENGL_ES2_BIT + SURFACE_TYPE=0 以兼容严格驱动。
+    let surfaceless = [
+        egl::RENDERABLE_TYPE,
+        egl::OPENGL_ES2_BIT,
+        egl::SURFACE_TYPE,
+        0,
+        egl::NONE,
+    ];
     let candidates: [(&str, &[i32]); 2] = [("pbuffer", &pbuffer), ("surfaceless", &surfaceless)];
     for (label, attributes) in candidates {
         match instance.choose_first_config(display, attributes) {
@@ -1355,6 +1407,25 @@ fn gbm_device_ptr<T: AsFd>(device: &gbm::Device<T>) -> *mut c_void {
 /// 真机事实（NVIDIA 620.70 / Mesa 26.2.7 gbm nvidia 后端）：
 /// `RENDERING|LINEAR` 直接 `EINVAL`，`RENDERING` 拿到 block-linear
 /// `0x0300000000E08014`。所以按下面的顺序试，成功即用，**不**强求 LINEAR。
+/// 仅接受单平面 GBM BO：辅助压缩面（如 Intel CCS，plane_count > 1）在后续
+/// 导出单 fd 时会被截断导致花屏或拒绝，拒绝后继续尝试非压缩或 LINEAR 回退。
+fn accept_single_plane_bo(
+    label: &str,
+    buffer: gbm::BufferObject<()>,
+) -> Option<gbm::BufferObject<()>> {
+    let planes = buffer.plane_count();
+    if planes > 1 {
+        tracing::debug!(
+            flags = label,
+            planes,
+            modifier = format!("0x{:016X}", u64::from(buffer.modifier())),
+            "跳过多平面 GBM BO（如 CCS 压缩面），尝试下一种 modifier/策略"
+        );
+        return None;
+    }
+    Some(buffer)
+}
+
 fn allocate_output(
     device: &gbm::Device<File>,
     node: &Path,
@@ -1386,12 +1457,14 @@ fn allocate_output(
                 flags,
             ) {
                 Ok(buffer) => {
-                    tracing::debug!(
-                        flags = label,
-                        modifier = format!("0x{:016X}", u64::from(buffer.modifier())),
-                        "gbm 输出缓冲已按合成器首选 modifier 分配"
-                    );
-                    return Ok(buffer);
+                    if let Some(accepted) = accept_single_plane_bo(label, buffer) {
+                        tracing::debug!(
+                            flags = label,
+                            modifier = format!("0x{:016X}", u64::from(accepted.modifier())),
+                            "gbm 输出缓冲已按合成器首选 modifier 分配"
+                        );
+                        return Ok(accepted);
+                    }
                 }
                 Err(error) => {
                     tracing::debug!(flags = label, %error, "按首选 modifier 分配失败");
@@ -1405,11 +1478,13 @@ fn allocate_output(
             explicit_mods.into_iter(),
         ) {
             Ok(buffer) => {
-                tracing::debug!(
-                    modifier = format!("0x{:016X}", u64::from(buffer.modifier())),
-                    "gbm 输出缓冲已按合成器首选 modifier 分配（无 flags）"
-                );
-                return Ok(buffer);
+                if let Some(accepted) = accept_single_plane_bo("preferred(no-flags)", buffer) {
+                    tracing::debug!(
+                        modifier = format!("0x{:016X}", u64::from(accepted.modifier())),
+                        "gbm 输出缓冲已按合成器首选 modifier 分配（无 flags）"
+                    );
+                    return Ok(accepted);
+                }
             }
             Err(error) => {
                 tracing::debug!(%error, "按首选 modifier 分配失败（无 flags），回退默认梯队");
@@ -1440,8 +1515,10 @@ fn allocate_output(
     for (label, flags) in ladder {
         match device.create_buffer_object::<()>(width, height, Format::Xrgb8888, flags) {
             Ok(buffer) => {
-                tracing::debug!(flags = label, "gbm 输出缓冲已分配");
-                return Ok(buffer);
+                if let Some(accepted) = accept_single_plane_bo(label, buffer) {
+                    tracing::debug!(flags = label, "gbm 输出缓冲已分配");
+                    return Ok(accepted);
+                }
             }
             Err(error) => {
                 tracing::debug!(flags = label, %error, "gbm 分配失败，试下一组 flags");
@@ -1456,12 +1533,14 @@ fn allocate_output(
         [gbm::Modifier::Linear].into_iter(),
         BufferObjectFlags::RENDERING | BufferObjectFlags::WRITE,
     ) {
-        tracing::debug!("gbm 输出缓冲已按显式 LINEAR 分配");
-        return Ok(buffer);
+        if let Some(accepted) = accept_single_plane_bo("explicit(LINEAR)", buffer) {
+            tracing::debug!("gbm 输出缓冲已按显式 LINEAR 分配");
+            return Ok(accepted);
+        }
     }
     Err(init_error(
         node,
-        format!("gbm 无法分配 {width}x{height} 的 XRGB8888 渲染缓冲"),
+        format!("gbm 无法分配单平面 {width}x{height} XRGB8888 渲染缓冲"),
     ))
 }
 
@@ -1656,7 +1735,7 @@ struct ImageKey {
     width: u32,
     height: u32,
     fourcc: u32,
-    modifier: u64,
+    modifier: Option<u64>,
     uv_swap: bool,
 }
 
@@ -1679,7 +1758,7 @@ impl ImageKey {
             width: plane.width,
             height: plane.height,
             fourcc: plane.fourcc,
-            modifier: plane.modifier.unwrap_or(0),
+            modifier: plane.modifier,
             uv_swap,
         })
     }
@@ -1716,6 +1795,10 @@ impl ImageCache {
             self.entries.pop_back();
         }
         self.entries.push_front((key, image));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
     }
 }
 
@@ -2008,6 +2091,10 @@ impl RgbConverter {
                         return Err(error);
                     }
                 };
+            if buffer.plane_count() > 1 {
+                Self::destroy_slots(renderer, &slots);
+                return Err(init_error(node, "gbm 输出缓冲仍为多平面格式，无法安全导出"));
+            }
             let fd = match buffer.fd() {
                 Ok(fd) => fd,
                 Err(error) => {
@@ -2187,10 +2274,21 @@ impl RgbConverter {
             return Err(VaapiError::Busy);
         };
         self.next_slot = (slot_index + 1) % slots;
-        self.renderer.acquire()?;
+        if let Err(err) = self.renderer.acquire() {
+            self.images.clear();
+            return Err(err);
+        }
         let painted = self.paint(slot_index, frame);
         self.renderer.release();
-        let stage = painted?;
+        let stage = match painted {
+            Ok(stage) => stage,
+            Err(err) => {
+                if err.to_string().contains("EGL_CONTEXT_LOST") {
+                    self.images.clear();
+                }
+                return Err(err);
+            }
+        };
         self.stats.record(FrameTimings {
             total: started.elapsed(),
             stage,

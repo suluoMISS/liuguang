@@ -167,6 +167,14 @@ impl MediaRoot {
         let mut existing = dir.to_path_buf();
         let mut tail: Vec<std::ffi::OsString> = Vec::new();
         while !existing.exists() {
+            if let Ok(meta) = std::fs::symlink_metadata(&existing)
+                && meta.file_type().is_symlink()
+            {
+                return Err(PathError::new(
+                    PathErrorCode::PathOutsideRoot,
+                    format!("悬空符号链接不可作为媒体目录: {text}"),
+                ));
+            }
             let Some(name) = existing.file_name().map(|n| n.to_os_string()) else {
                 break;
             };
@@ -450,6 +458,15 @@ mod tests {
         assert_eq!(
             p.check_dir_in_root(Path::new("images")).unwrap_err().code,
             PathErrorCode::InvalidParams
+        );
+        let _ = std::fs::symlink_metadata(&root);
+        std::os::unix::fs::symlink("/etc/nonexistent-escape", root.join("dangling"))
+            .expect("dangling symlink");
+        assert_eq!(
+            p.check_dir_in_root(&root.join("dangling"))
+                .unwrap_err()
+                .code,
+            PathErrorCode::PathOutsideRoot
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);

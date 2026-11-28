@@ -541,12 +541,30 @@ fn uniform_loc(gl: &GlFns, program: GLuint, name: &str) -> Result<GLint, RenderE
     Ok(loc)
 }
 
+fn checked_rgba_bytes(width: u32, height: u32) -> Result<usize, RenderError> {
+    let needed = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(4))
+        .ok_or(RenderError::OutputTooLarge {
+            needed: u64::MAX,
+            limit: crate::cpu::MAX_OUTPUT_BYTES as u64,
+        })?;
+    if needed > crate::cpu::MAX_OUTPUT_BYTES {
+        return Err(RenderError::OutputTooLarge {
+            needed: needed as u64,
+            limit: crate::cpu::MAX_OUTPUT_BYTES as u64,
+        });
+    }
+    Ok(needed)
+}
+
 /// 把 [`CpuFrame`] 像素转换为 GL_RGBA8 顶行在前的字节流。
 ///
 /// Xrgb8888 内存 `[B,G,R,X]` → `(R,G,B,255)`；Rgba8888 原样（A 置 255）。
 fn frame_to_rgba(frame: &CpuFrame) -> Result<Vec<u8>, RenderError> {
     frame.validate().map_err(RenderError::InvalidFrame)?;
-    let mut out = vec![0u8; (frame.width * frame.height * 4) as usize];
+    let bytes = checked_rgba_bytes(frame.width, frame.height)?;
+    let mut out = vec![0u8; bytes];
     for y in 0..frame.height {
         for x in 0..frame.width {
             let src = (y * frame.stride + x * 4) as usize;
@@ -573,7 +591,7 @@ fn frame_to_rgba(frame: &CpuFrame) -> Result<Vec<u8>, RenderError> {
 
 /// 把 `glReadPixels` 的 GL_RGBA8（底行在前）转换为 Xrgb8888 [`CpuFrame`]（顶行在前）。
 fn rgba_to_xrgb_frame(pixels: &[u8], width: u32, height: u32) -> Result<CpuFrame, RenderError> {
-    let needed = (width * height * 4) as usize;
+    let needed = checked_rgba_bytes(width, height)?;
     if pixels.len() < needed {
         return Err(RenderError::Failed(format!(
             "glReadPixels 数据不足: {} < {needed}",
@@ -607,12 +625,13 @@ fn rgba_to_xrgb_frame(pixels: &[u8], width: u32, height: u32) -> Result<CpuFrame
 // GlesTransition
 // ---------------------------------------------------------------------------
 
-/// EGL 上下文与表面（`release` 时销毁）。
+/// EGL 上下文与表面（`release` 时销毁；`_gbm` 放末尾保证先销毁 EGLdisplay 再销毁 GBM 设备）。
 struct EglState {
     instance: EglInstance,
     display: egl::Display,
     context: egl::Context,
     surface: egl::Surface,
+    _gbm: gbm::Device<std::os::fd::OwnedFd>,
 }
 
 /// GLES 转场渲染器（**真机未验证，仅编译级交付**）。
@@ -653,10 +672,13 @@ impl GlesTransition {
         if width == 0 || height == 0 {
             return Err(RenderError::InvalidOutput { width, height });
         }
+        let _ = checked_rgba_bytes(width, height)?;
 
-        // SAFETY：fd 由 BorrowedFd 借用约束保证有效，本模块不关闭它
-        // （模块文档 invariant 4）。
-        let gbm_device = gbm::Device::new(gbm_device_fd)
+        // 克隆 fd 以延长 gbm::Device 生命周期覆盖整个 EglState（直到 eglTerminate 之后再 drop）。
+        let owned_fd = gbm_device_fd
+            .try_clone_to_owned()
+            .map_err(|e| RenderError::Failed(format!("复制 GBM fd 失败: {e}")))?;
+        let gbm_device = gbm::Device::new(owned_fd)
             .map_err(|e| RenderError::Failed(format!("GBM 设备打开失败: {e}")))?;
         let gbm_ptr = gbm_device_ptr(&gbm_device);
 
@@ -792,6 +814,7 @@ impl GlesTransition {
                 display,
                 context,
                 surface,
+                _gbm: gbm_device,
             }),
             gl: Some(gl),
             frame_tex,
@@ -922,7 +945,8 @@ impl GlesTransition {
         (gl.draw_arrays)(GL_TRIANGLE_STRIP, 0, 4);
         check_gl(gl, "glDrawArrays")?;
 
-        let mut pixels = vec![0u8; (self.width * self.height * 4) as usize];
+        let out_bytes = checked_rgba_bytes(self.width, self.height)?;
+        let mut pixels = vec![0u8; out_bytes];
         // 依据：pixels 长度恰为 width*height*4（invariant 3）。
         (gl.read_pixels)(
             0,
@@ -940,9 +964,9 @@ impl GlesTransition {
     /// 释放纹理/FBO/着色器与 EGL 上下文等中间资源（可重复调用）。
     pub fn release(&mut self) {
         self.uploaded = false;
-        self.programs = [None, None, None, None];
+        let programs = std::mem::take(&mut self.programs);
         if let (Some(gl), Some(egl_state)) = (self.gl.as_ref(), self.egl.as_ref()) {
-            for program in self.programs.iter().flatten() {
+            for program in programs.iter().flatten() {
                 (gl.delete_program)(*program);
             }
             for tex in self.frame_tex {

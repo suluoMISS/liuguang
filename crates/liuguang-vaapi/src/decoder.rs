@@ -227,14 +227,17 @@ fn shared_device(render_node: &Path) -> Result<*mut ffi::AvBufferRef, VaapiError
     Ok(reference)
 }
 
-/// 丢弃某个节点的共享设备（节点被拔掉/驱动重启后调用；下次打开会重新初始化）。
-///
-/// 调用方必须保证没有解码器仍在使用该节点的显示——正常路径不会调用它，只有显式重置
-/// （测试或运维）才需要。
-#[allow(dead_code)]
-pub(crate) fn forget_device(render_node: &Path) {
+/// 丢弃某个节点的共享设备（节点被拔掉/驱动重启/EGL CONTEXT_LOST 后调用；下次打开会重新初始化）。
+pub fn forget_device(render_node: &Path) {
     if let Ok(mut cache) = devices().lock() {
         cache.remove(render_node);
+    }
+}
+
+/// 清空全部缓存的共享 VA-API 设备（系统休眠恢复或长阻塞重置时调用）。
+pub fn forget_all_devices() {
+    if let Ok(mut cache) = devices().lock() {
+        cache.clear();
     }
 }
 

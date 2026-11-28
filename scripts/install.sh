@@ -91,6 +91,52 @@ run_as_root() {
   return 1
 }
 
+toml_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
+write_unit_with_bin() {
+  local src="$1" dst="$2" bin="$3"
+  local escaped_bin="$bin"
+  if [[ "$bin" =~ [[:space:]\"\\] ]]; then
+    escaped_bin="\"$(printf '%s' "$bin" | sed 's/\\/\\\\/g; s/"/\\"/g')\""
+  fi
+  awk -v bin="$escaped_bin" '
+    /^ExecStart=/ {
+      rest = substr($0, 11)
+      sp = index(rest, " ")
+      if (sp > 0) {
+        print "ExecStart=" bin substr(rest, sp)
+      } else {
+        print "ExecStart=" bin
+      }
+      next
+    }
+    { print }
+  ' "$src" > "$dst"
+}
+
+import_user_session_env() {
+  local vars=()
+  for name in WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE \
+              DESKTOP_SESSION XDG_RUNTIME_DIR NIRI_SOCKET HYPRLAND_INSTANCE_SIGNATURE \
+              SWAYSOCK DISPLAY; do
+    if [ -n "${!name:-}" ]; then
+      vars+=("$name")
+    fi
+  done
+  if [ "${#vars[@]}" -gt 0 ]; then
+    if [ "$DRY_RUN" = 0 ]; then
+      systemctl --user import-environment "${vars[@]}" 2>/dev/null || true
+    else
+      run systemctl --user import-environment "${vars[@]}"
+    fi
+  fi
+}
+
 ask_confirm() {
   local prompt="$1"
   if [ "$AUTO_YES" = 1 ]; then
@@ -220,6 +266,13 @@ user_paths() {
   CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/liuguang"
   RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/liuguang"
   PICTURES="$HOME/Pictures"
+  if command -v xdg-user-dir >/dev/null 2>&1; then
+    local xdg_pics
+    xdg_pics="$(xdg-user-dir PICTURES 2>/dev/null || true)"
+    if [ -n "$xdg_pics" ] && [ "$xdg_pics" != "$HOME" ]; then
+      PICTURES="$xdg_pics"
+    fi
+  fi
   # 媒体库统一到一个目录（图片和视频都放这里）。`slideshow.directory` 只扫一层，
   # 指向 $PICTURES 根目录会一张都扫不到 —— 用户会看到"服务在跑但屏幕没变"。
   MEDIA_DIR="$PICTURES/Wallpapers"
@@ -260,6 +313,9 @@ user_check() {
 }
 
 user_config_template() {
+  local pic_esc media_esc
+  pic_esc="$(toml_escape "$PICTURES")"
+  media_esc="$(toml_escape "$MEDIA_DIR")"
   cat <<EOF
 # 流光（Liuguang）用户会话配置（由 scripts/install.sh --mode user 生成）
 # 全部字段说明见仓库 config/example.toml；改完执行：systemctl --user reload liuguang
@@ -268,19 +324,19 @@ user_config_template() {
 backend = "auto"        # auto：有 WAYLAND_DISPLAY 就用桌面壁纸层
 
 [media]
-allowed_roots = ["$PICTURES"]
+allowed_roots = ["$pic_esc"]
 video_vaapi = "auto"    # 需 --features vaapi 构建；auto 会挑与合成器同卡的渲染节点
 
 # 媒体库：**没有这一段，GUI/TUI 的媒体列表永远是空的**
 # （list_media 会返回 NOT_CONFIGURED，而守护进程照常运行，很容易误判成"没这功能"）。
 [library]
-root = "$PICTURES"
-image_dirs = ["$MEDIA_DIR"]
-video_dirs = ["$MEDIA_DIR"]
+root = "$pic_esc"
+image_dirs = ["$media_esc"]
+video_dirs = ["$media_esc"]
 recursive = true
 
 [slideshow]
-directory = "$MEDIA_DIR"
+directory = "$media_esc"
 interval_seconds = 300
 
 [performance]
@@ -380,16 +436,12 @@ install_user() {
     note "安装到 $UNIT_FILE（ExecStart=$bin）"
     if [ "$DRY_RUN" = 0 ]; then
       mkdir -p "$UNIT_DIR"
-      sed "s#^ExecStart=[^ ]*#ExecStart=$bin#" "$src" > "$UNIT_FILE"
+      write_unit_with_bin "$src" "$UNIT_FILE" "$bin"
       chmod 644 "$UNIT_FILE"
     fi
   fi
-  # 确保用户 systemd 实例能拿到当前 Wayland 会话环境（首次登录刚进会话时常见问题）。
-  if [ "$DRY_RUN" = 0 ]; then
-    systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR 2>/dev/null || true
-  else
-    run systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR
-  fi
+  # 确保用户 systemd 实例能拿到当前 Wayland/合成器会话环境（首次登录刚进会话时常见问题）。
+  import_user_session_env
   run systemctl --user daemon-reload
   run systemctl --user enable --now "$UNIT_NAME"
 
@@ -493,14 +545,18 @@ escalate_system_if_needed() {
   if [ "$(id -u)" -eq 0 ] || [ "$DRY_RUN" = 1 ]; then
     return 0
   fi
-  say "系统模式（$action_desc）需要管理员权限以创建系统用户、写入 /etc/liuguang 与 /usr/lib/systemd/system。"
+  say "系统模式（$action_desc）需要管理员权限以创建系统用户、写入 /etc/liuguang 与 /etc/systemd/system。"
+  local script_abs="$0"
+  if command -v readlink >/dev/null 2>&1; then
+    script_abs="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+  fi
   if command -v sudo >/dev/null 2>&1 && { [ -t 0 ] || sudo -n true >/dev/null 2>&1; }; then
-    exec sudo -- "$0" "${ORIG_ARGS[@]}"
+    exec sudo -- "$script_abs" "${ORIG_ARGS[@]}"
   elif [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v pkexec >/dev/null 2>&1; then
-    exec pkexec "$0" "${ORIG_ARGS[@]}"
+    exec pkexec env PATH="$PATH" "$script_abs" "${ORIG_ARGS[@]}"
   else
     bad "无法自动请求管理员权限（非交互终端且未配置免密 sudo）。"
-    say "  请以管理员身份执行：sudo $0 ${ORIG_ARGS[*]}"
+    say "  请以管理员身份执行：sudo $script_abs ${ORIG_ARGS[*]}"
     exit 1
   fi
 }
@@ -588,8 +644,11 @@ install_system() {
 
   say
   say "== systemd 系统单元 =="
-  local unit_dst="/usr/lib/systemd/system/$UNIT_NAME"
-  if [ -f "$unit_dst" ]; then
+  local pkg_unit="/usr/lib/systemd/system/$UNIT_NAME"
+  local unit_dst="/etc/systemd/system/$UNIT_NAME"
+  if [ -f "$pkg_unit" ]; then
+    ok "包内系统单元已存在：$pkg_unit"
+  elif [ -f "$unit_dst" ]; then
     ok "单元已存在：$unit_dst"
   else
     local unit_src="$REPO/packaging/liuguang.service"
@@ -597,8 +656,8 @@ install_system() {
     note "安装 $unit_dst（ExecStart=$bin）"
     if [ "$DRY_RUN" = 0 ]; then
       mkdir -p "$(dirname "$unit_dst")"
-      # 只替换可执行文件第一段，保留 --config / --socket / --state-file 参数！
-      sed "s#^ExecStart=[^ ]*#ExecStart=$bin#" "$unit_src" > "$unit_dst"
+      # 只替换可执行文件第一段，保留 --config / --socket / --state-file 参数。
+      write_unit_with_bin "$unit_src" "$unit_dst" "$bin"
       chmod 644 "$unit_dst"
     fi
   fi
@@ -648,7 +707,7 @@ uninstall_system() {
   if [ "$DRY_RUN" = 0 ] && [ "$(id -u)" -ne 0 ]; then bad "卸载系统单元需要 root"; exit 1; fi
   say "== 卸载系统单元 =="
   run systemctl disable --now "$UNIT_NAME" || true
-  run rm -f "/usr/lib/systemd/system/$UNIT_NAME"
+  run rm -f "/etc/systemd/system/$UNIT_NAME"
   run systemctl daemon-reload || true
   say
   say "已移除单元。**用户、组、配置、媒体都保留**，需要彻底清理时："

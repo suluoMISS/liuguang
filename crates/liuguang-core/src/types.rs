@@ -140,7 +140,13 @@ impl CpuFrame {
         if self.width == 0 || self.height == 0 {
             return Err(FrameError::ZeroDimension);
         }
-        let min_stride = self.width.saturating_mul(self.format.bytes_per_pixel());
+        let min_stride = self
+            .width
+            .checked_mul(self.format.bytes_per_pixel())
+            .ok_or(FrameError::StrideTooSmall {
+                stride: self.stride,
+                min_stride: u32::MAX,
+            })?;
         if self.stride < min_stride {
             return Err(FrameError::StrideTooSmall {
                 stride: self.stride,

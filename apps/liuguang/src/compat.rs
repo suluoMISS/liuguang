@@ -134,6 +134,7 @@ fn detect_av1_hardware() -> bool {
 /// 用 `wait_timeout` 式的轮询实现（不引依赖）：子进程短命（vainfo 几百毫秒），
 /// 轮询 50ms 足够。
 fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    use std::io::Read as _;
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -141,6 +142,21 @@ fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<S
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
+    const MAX_OUTPUT_BYTES: u64 = 256 * 1024;
+    let out_reader = child.stdout.take().map(|stdout| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.take(MAX_OUTPUT_BYTES).read_to_end(&mut buf);
+            buf
+        })
+    });
+    let err_reader = child.stderr.take().map(|stderr| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr.take(MAX_OUTPUT_BYTES).read_to_end(&mut buf);
+            buf
+        })
+    });
     let started = std::time::Instant::now();
     loop {
         match child.try_wait() {
@@ -151,18 +167,33 @@ fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<S
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                if let Some(h) = out_reader {
+                    let _ = h.join();
+                }
+                if let Some(h) = err_reader {
+                    let _ = h.join();
+                }
                 tracing::warn!(program, "命令超时，已终止");
                 return None;
             }
             Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(h) = out_reader {
+                    let _ = h.join();
+                }
+                if let Some(h) = err_reader {
+                    let _ = h.join();
+                }
                 tracing::warn!(program, %error, "等待命令失败");
                 return None;
             }
         }
     }
-    let output = child.wait_with_output().ok()?;
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    let stdout = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    let mut text = String::from_utf8_lossy(&stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&stderr));
     Some(text)
 }
 
@@ -1219,7 +1250,11 @@ fn unescape_rbsp(bytes: &[u8]) -> Vec<u8> {
             zeros = 0;
             continue;
         }
-        zeros = if byte == 0 { zeros + 1 } else { 0 };
+        zeros = if byte == 0 {
+            zeros.saturating_add(1)
+        } else {
+            0
+        };
         out.push(byte);
     }
     out
@@ -2108,5 +2143,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn unescape_rbsp_handles_over_255_consecutive_zeros() {
+        let mut raw = vec![0u8; 300];
+        raw.push(0x03);
+        raw.push(0xAA);
+        let unescaped = unescape_rbsp(&raw);
+        assert_eq!(unescaped.len(), 301);
+        assert_eq!(unescaped.last().copied(), Some(0xAA));
     }
 }

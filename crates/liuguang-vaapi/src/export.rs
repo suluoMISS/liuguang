@@ -155,6 +155,18 @@ pub fn export_surface(
     display: ffi::VaDisplay,
     surface: ffi::VaSurfaceId,
 ) -> Result<ExportedSurface, VaapiError> {
+    // 异步硬件解码在交出 surface id 时未必已完成写回；先同步再导出 PRIME 2。
+    // SAFETY: display 与 surface 来自同一存活 VA 会话。
+    let sync_status = unsafe { ffi::vaSyncSurface(display, surface) };
+    if sync_status != ffi::VA_STATUS_SUCCESS {
+        return Err(VaapiError::Export {
+            surface,
+            message: format!(
+                "vaSyncSurface 失败: {}",
+                crate::device::va_status_text(sync_status)
+            ),
+        });
+    }
     let mut descriptor = ffi::VaDrmPrimeSurfaceDescriptor::new();
     let flags = ffi::VA_EXPORT_SURFACE_READ_ONLY | ffi::VA_EXPORT_SURFACE_SEPARATE_LAYERS;
     // SAFETY: display 由 `VaDevice` 持有且仍存活；surface 来自同一显示解出的帧；

@@ -66,14 +66,36 @@ pub fn default_desktop_config_toml(media_dir: &Path) -> String {
         }),
         ..Default::default()
     };
+    let escaped = media_dir
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     cfg.to_toml_string().unwrap_or_else(|_| {
         format!(
-            "[display]\nbackend = \"auto\"\n\n[library]\nroot = \"{}\"\nimage_dirs = [\"{}\"]\nvideo_dirs = [\"{}\"]\nrecursive = true\n",
-            media_dir.display(),
-            media_dir.display(),
-            media_dir.display()
+            "[display]\nbackend = \"auto\"\n\n[library]\nroot = \"{escaped}\"\nimage_dirs = [\"{escaped}\"]\nvideo_dirs = [\"{escaped}\"]\nrecursive = true\n"
         )
     })
+}
+
+fn desktop_env_vars_to_import() -> Vec<&'static str> {
+    const CANDIDATES: &[&str] = &[
+        "WAYLAND_DISPLAY",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_DESKTOP",
+        "XDG_SESSION_TYPE",
+        "DESKTOP_SESSION",
+        "XDG_RUNTIME_DIR",
+        "NIRI_SOCKET",
+        "HYPRLAND_INSTANCE_SIGNATURE",
+        "SWAYSOCK",
+        "DISPLAY",
+    ];
+    CANDIDATES
+        .iter()
+        .copied()
+        .filter(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
+        .collect()
 }
 
 /// 查询用户级 systemd 单元与配置现状。
@@ -153,14 +175,15 @@ pub fn ensure_user_setup(config_path: &Path) -> Result<PathBuf, String> {
             .map_err(|e| format!("写入默认配置失败（{}）：{e}", config_path.display()))?;
     }
 
-    // 把当前 Wayland 会话变量同步给 systemd --user，避免首次安装/登录后单元找不到 WAYLAND_DISPLAY。
-    let _ = run_systemctl(&[
-        "--user",
-        "import-environment",
-        "WAYLAND_DISPLAY",
-        "XDG_CURRENT_DESKTOP",
-        "XDG_RUNTIME_DIR",
-    ]);
+    // 把当前 Wayland/合成器会话变量同步给 systemd --user，避免首次安装/登录后单元找不到环境。
+    let env_vars = desktop_env_vars_to_import();
+    if !env_vars.is_empty() {
+        let mut import_args = Vec::with_capacity(2 + env_vars.len());
+        import_args.push("--user");
+        import_args.push("import-environment");
+        import_args.extend(env_vars);
+        let _ = run_systemctl(&import_args);
+    }
     let _ = run_systemctl(&["--user", "daemon-reload"]);
     Ok(media_dir)
 }

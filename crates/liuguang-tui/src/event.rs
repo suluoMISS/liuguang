@@ -272,12 +272,12 @@ impl From<&TransitionDraft> for TransitionParamsOwned {
     }
 }
 
-/// 按键 → 意图（`docs/TUI_DESIGN.md` §6；优先级：模态框 > 搜索框 > 全局）。
+/// 按键 → 意图（`docs/TUI_DESIGN.md` §6；优先级：Ctrl+C > 模态框 > 搜索框 > 页面键 > 全局）。
 pub fn action_for(state: &AppState, key: KeyEvent) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-    // 0) 全局退出键（含 Ctrl+C）。
-    if (ctrl && key.code == KeyCode::Char('c')) || (!ctrl && key.code == KeyCode::Char('Q')) {
+    // 0) 全局强制退出 Ctrl+C。
+    if ctrl && key.code == KeyCode::Char('c') {
         return Some(Action::Quit);
     }
 
@@ -334,11 +334,25 @@ pub fn action_for(state: &AppState, key: KeyEvent) -> Option<Action> {
         };
     }
 
-    // 1.4) t24：转场页 `A` = **试应用转场**（只改运行时；未实现的效果不下发）。
+    // 2) 搜索框聚焦（必须在页面热键前，否则在库页按 a / Q / 方向键会被热键抢走）。
+    if state.search_focus {
+        return match key.code {
+            KeyCode::Esc => Some(Action::Cancel),
+            KeyCode::Enter => Some(Action::Confirm),
+            KeyCode::Backspace => Some(Action::Edit(EditOp::Backspace)),
+            KeyCode::Delete => Some(Action::Edit(EditOp::Delete)),
+            KeyCode::Up => Some(Action::Move(-1)),
+            KeyCode::Down => Some(Action::Move(1)),
+            KeyCode::Char(c) if !ctrl => Some(Action::Edit(EditOp::Insert(c))),
+            _ => None,
+        };
+    }
+
+    // 2.4) t24：转场页 `A` = **试应用转场**（只改运行时；未实现的效果不下发）。
     if state.page == Page::Effects && !ctrl && key.code == KeyCode::Char('A') {
         return Some(Action::ApplyTransition);
     }
-    // 1.5) t24：播放列表页的编辑键（**仅该页**；模态框已在上面优先处理，故不冲突）。
+    // 2.5) 静态/播放列表页键。
     if state.page == Page::Static && !ctrl {
         match key.code {
             KeyCode::Char('a') => return Some(Action::StaticSet),
@@ -347,15 +361,14 @@ pub fn action_for(state: &AppState, key: KeyEvent) -> Option<Action> {
         }
     }
     if state.page == Page::Playlists && !ctrl {
-        // t67：**主界面核心操作** = 选择 / ←→ 切模式 / a 加入 / Enter 播放；
-        // 其余（m v r o + - x A S）是"高级操作"，仍在 keymap 里可用，
-        // 但只由 `?` 的高级面板列出（`page_help`）。
+        // t67：**主界面核心操作** = 选择 / ←→ 切模式 / a 加入 / Enter 播放
         match key.code {
             // ←/→ = 切播放模式（本页不再走"子页切换"；Tab 仍可切焦点）
             KeyCode::Left => return Some(Action::PlaylistMode(false)),
             KeyCode::Right => return Some(Action::PlaylistMode(true)),
             KeyCode::Enter => return Some(Action::PlaylistPlayEntry),
             KeyCode::Char('a') => return Some(Action::PlaylistAddToCurrent),
+            KeyCode::Char('N') => return Some(Action::PlaylistRename),
             // Esc 与 `x` 等价：放弃编辑（不能让编辑态成为"关不掉"的陷阱）
             KeyCode::Esc if state.playlist_edit.is_some() => {
                 return Some(Action::PlaylistDiscard);
@@ -382,34 +395,20 @@ pub fn action_for(state: &AppState, key: KeyEvent) -> Option<Action> {
         } else {
             match key.code {
                 KeyCode::Char('n') => return Some(Action::PlaylistNew),
-                KeyCode::Char('N') => return Some(Action::PlaylistRename),
                 KeyCode::Char('e') => return Some(Action::PlaylistEdit),
                 _ => {}
             }
         }
     }
 
-    // 1.6) t67：媒体库页 `a` = 把选中项加入**当前播放列表**（与播放列表页同一个动作）。
+    // 2.6) t67：媒体库页 `a` = 把选中项加入**当前播放列表**（与播放列表页同一个动作）。
     if state.page == Page::Library && !ctrl && key.code == KeyCode::Char('a') {
         return Some(Action::PlaylistAddToCurrent);
     }
 
-    // 2) 搜索框聚焦。
-    if state.search_focus {
-        return match key.code {
-            KeyCode::Esc => Some(Action::Cancel),
-            KeyCode::Enter => Some(Action::Confirm),
-            KeyCode::Backspace => Some(Action::Edit(EditOp::Backspace)),
-            KeyCode::Delete => Some(Action::Edit(EditOp::Delete)),
-            KeyCode::Up => Some(Action::Move(-1)),
-            KeyCode::Down => Some(Action::Move(1)),
-            KeyCode::Char(c) if !ctrl => Some(Action::Edit(EditOp::Insert(c))),
-            _ => None,
-        };
-    }
-
     // 3) 全局与页面键。
     match key.code {
+        KeyCode::Char('Q') if !ctrl => Some(Action::Quit),
         KeyCode::Tab => Some(Action::FocusMove(
             !key.modifiers.contains(KeyModifiers::SHIFT),
         )),
@@ -1807,5 +1806,34 @@ mod tests {
         apply(&mut st, Action::ResetTransform);
         assert_eq!(st.transform.brightness_percent(), 100);
         assert_eq!(st.transform.fit, "cover");
+    }
+
+    #[test]
+    fn typing_q_and_a_in_search_or_modal_does_not_quit_or_trigger_page_hotkeys() {
+        let mut st = AppState::new();
+        st.page = Page::Library;
+        st.search_focus = true;
+        assert_eq!(
+            action_for(&st, key(KeyCode::Char('Q'))),
+            Some(Action::Edit(EditOp::Insert('Q')))
+        );
+        assert_eq!(
+            action_for(&st, key(KeyCode::Char('a'))),
+            Some(Action::Edit(EditOp::Insert('a')))
+        );
+
+        st.search_focus = false;
+        st.modal = Some(Modal::TextInput {
+            title: "t".into(),
+            target: TextTarget::PlaylistName,
+            hint: "h".into(),
+        });
+        assert_eq!(
+            action_for(&st, key(KeyCode::Char('Q'))),
+            Some(Action::Edit(EditOp::Insert('Q')))
+        );
+
+        st.modal = None;
+        assert_eq!(action_for(&st, key(KeyCode::Char('Q'))), Some(Action::Quit));
     }
 }

@@ -240,18 +240,34 @@ fn replace_value(table: &mut toml_edit::Table, key: &str, mut value: toml_edit::
 /// 与 `save_state_file` 同一套做法，理由也一样：**半个文件比旧文件更糟**——
 /// 断电/写满时用户至少还能启动。
 fn write_atomic(path: &Path, contents: &str) -> Result<(), ConfigStoreError> {
-    let tmp = path.with_extension("toml.tmp");
-    {
-        let mut file = std::fs::File::create(&tmp).map_err(ConfigStoreError::Write)?;
-        file.write_all(contents.as_bytes())
-            .map_err(ConfigStoreError::Write)?;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.toml".to_string());
+    let tmp = dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
+    let write_res = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
         // 落盘顺序：先把内容刷到盘上，再让目录项改名指向它。
-        file.sync_all().map_err(ConfigStoreError::Write)?;
-    }
-    std::fs::rename(&tmp, path).map_err(|e| {
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
         let _ = std::fs::remove_file(&tmp);
-        ConfigStoreError::Write(e)
-    })
+        return Err(ConfigStoreError::Write(e));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -932,7 +932,11 @@ pub fn blank_texture(width: i32, height: i32) -> gdk::Texture {
         let tex: gdk::Texture =
             gdk::MemoryTexture::new(key.0, key.1, gdk::MemoryFormat::R8g8b8a8, &bytes, stride)
                 .upcast();
-        cache.borrow_mut().insert(key, tex.clone());
+        let mut map = cache.borrow_mut();
+        if map.len() >= 64 {
+            map.clear();
+        }
+        map.insert(key, tex.clone());
         tex
     })
 }

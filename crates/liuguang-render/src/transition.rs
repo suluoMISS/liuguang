@@ -190,7 +190,13 @@ impl CpuTransition {
         };
         let eased = apply_easing(self.spec.easing, progress);
         let (width, height, format) = (from.width, from.height, from.format);
-        let stride = width * format.bytes_per_pixel();
+        let stride =
+            width
+                .checked_mul(format.bytes_per_pixel())
+                .ok_or(RenderError::OutputTooLarge {
+                    needed: u64::MAX,
+                    limit: crate::cpu::MAX_OUTPUT_BYTES as u64,
+                })?;
 
         let preferred = self.next % self.buffers.len();
         let other = (preferred + 1) % self.buffers.len();
@@ -242,7 +248,13 @@ impl CpuTransition {
 
 /// 分配与输入帧同布局的零缓冲。
 fn new_buffer(width: u32, height: u32, format: PixelFormat) -> Result<Vec<u8>, RenderError> {
-    let stride = width * format.bytes_per_pixel();
+    let stride =
+        width
+            .checked_mul(format.bytes_per_pixel())
+            .ok_or(RenderError::OutputTooLarge {
+                needed: u64::MAX,
+                limit: crate::cpu::MAX_OUTPUT_BYTES as u64,
+            })?;
     let needed =
         (stride as usize)
             .checked_mul(height as usize)

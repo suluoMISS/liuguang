@@ -1024,10 +1024,13 @@ impl Config {
         }
 
         // slideshow
-        if self.slideshow.interval_seconds == 0 {
+        const MAX_INTERVAL_SECONDS: u64 = 31_536_000;
+        if self.slideshow.interval_seconds == 0
+            || self.slideshow.interval_seconds > MAX_INTERVAL_SECONDS
+        {
             return Err(ConfigError::invalid_field(
                 "slideshow.interval_seconds",
-                "必须 >= 1",
+                format!("应在 1..={MAX_INTERVAL_SECONDS} 秒"),
             ));
         }
         if self.slideshow.enabled && !self.slideshow.directory.is_absolute() {
@@ -1155,10 +1158,10 @@ impl Config {
                 }
             }
             if let Some(interval) = out.interval_seconds {
-                if interval == 0 {
+                if interval == 0 || interval > MAX_INTERVAL_SECONDS {
                     return Err(ConfigError::invalid_field(
                         format!("outputs.{name}.interval_seconds"),
-                        "必须 >= 1",
+                        format!("应在 1..={MAX_INTERVAL_SECONDS} 秒"),
                     ));
                 }
             }
@@ -1234,9 +1237,14 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "config.toml".to_string());
-    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    static ATOMIC_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = ATOMIC_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
     let write = || -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
@@ -1946,5 +1954,22 @@ vsync = false
         assert!(bytes > 0);
         assert!(cfg_path.is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn huge_interval_seconds_is_rejected_by_validate() {
+        let mut cfg = Config::default();
+        cfg.slideshow.interval_seconds = i64::MAX as u64;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg2 = Config::default();
+        cfg2.outputs.insert(
+            "DP-1".into(),
+            OutputConfig {
+                interval_seconds: Some(i64::MAX as u64),
+                ..OutputConfig::default()
+            },
+        );
+        assert!(cfg2.validate().is_err());
     }
 }

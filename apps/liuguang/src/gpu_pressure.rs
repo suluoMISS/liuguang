@@ -190,18 +190,26 @@ impl Default for Sampler {
 }
 
 impl Sampler {
-    /// 起后台线程（严格幂等：多次调用只起一条线程）。既无 `nvidia-smi` 又无 AMD VRAM sysfs 时立刻退出。
+    /// 起后台线程（严格幂等：运行中再调用不会起第二条线程；`stop()` 后可再次启动）。
     pub fn start(&self) {
         if self.started.swap(true, Ordering::AcqRel) {
             return;
         }
+        {
+            let (lock, _) = &*self.stop;
+            if let Ok(mut guard) = lock.lock() {
+                *guard = false;
+            }
+        }
         let latest = Arc::clone(&self.latest);
         let stop = Arc::clone(&self.stop);
+        let started = Arc::clone(&self.started);
         let spawned = std::thread::Builder::new()
             .name("gpu-memory".to_string())
             .spawn(move || {
                 let Some(backend) = detect_backend() else {
                     tracing::debug!("未检测到 NVIDIA/AMD 显存探针，GPU 显存采样线程退出");
+                    started.store(false, Ordering::Release);
                     return;
                 };
                 loop {
@@ -227,6 +235,7 @@ impl Sampler {
                         break;
                     }
                 }
+                started.store(false, Ordering::Release);
             });
         if let Err(err) = spawned {
             self.started.store(false, Ordering::Release);
@@ -234,13 +243,14 @@ impl Sampler {
         }
     }
 
-    /// 通知采样线程停止（Controller 销毁时调用）。
+    /// 通知采样线程停止（Controller 销毁或配置关闭时调用）。
     pub fn stop(&self) {
         let (lock, cvar) = &*self.stop;
         if let Ok(mut guard) = lock.lock() {
             *guard = true;
             cvar.notify_all();
         }
+        self.started.store(false, Ordering::Release);
     }
 
     /// 最近一次读数。
@@ -250,8 +260,37 @@ impl Sampler {
     }
 }
 
-/// 跑一次 `nvidia-smi` 取显存；失败（没装/没卡/输出异常）返回 `None`。
+/// 检查是否所有已枚举的 NVIDIA PCI 设备均处于 runtime `suspended`（D3cold）。
+/// 若是，调用 `nvidia-smi` 会把独显从零功耗 D3cold 唤醒，必须跳过轮询。
+fn nvidia_all_suspended_in(pci_devices_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(pci_devices_dir) else {
+        return false;
+    };
+    let mut saw_nvidia = false;
+    for entry in entries.flatten() {
+        let dev = entry.path();
+        let Ok(vendor) = std::fs::read_to_string(dev.join("vendor")) else {
+            continue;
+        };
+        if !vendor.trim().eq_ignore_ascii_case("0x10de") {
+            continue;
+        }
+        saw_nvidia = true;
+        let Ok(status) = std::fs::read_to_string(dev.join("power/runtime_status")) else {
+            return false;
+        };
+        if status.trim() != "suspended" {
+            return false;
+        }
+    }
+    saw_nvidia
+}
+
+/// 跑一次 `nvidia-smi` 取显存；D3cold 休眠中或失败返回 `None`。
 fn query_nvidia() -> Option<Usage> {
+    if nvidia_all_suspended_in(Path::new("/sys/bus/pci/devices")) {
+        return None;
+    }
     let output = std::process::Command::new("nvidia-smi")
         .args([
             "--query-gpu=memory.used,memory.total",
@@ -316,6 +355,7 @@ impl Controller {
         let was_engaged = self.is_engaged();
         let Some(mut next_guard) = Guard::new(above, below) else {
             self.guard = None;
+            self.started_at = None;
             self.sampler.stop();
             return if was_engaged {
                 Action::Resume
@@ -430,6 +470,24 @@ mod tests {
 
     #[test]
     fn parses_amd_sysfs_vram_bytes() {
+        let dir = std::env::temp_dir().join(format!("liuguang-gpu-d3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d1 = dir.join("0000:01:00.0");
+        std::fs::create_dir_all(d1.join("power")).unwrap();
+        std::fs::write(d1.join("vendor"), "0x10de\n").unwrap();
+        std::fs::write(d1.join("power/runtime_status"), "suspended\n").unwrap();
+        assert!(nvidia_all_suspended_in(&dir));
+        std::fs::write(d1.join("power/runtime_status"), "active\n").unwrap();
+        assert!(!nvidia_all_suspended_in(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let sampler = Sampler::default();
+        sampler.stop();
+        let ctrl = Controller::new(85.0, 75.0);
+        let mut ctrl = ctrl;
+        assert_eq!(ctrl.reconfigure(0.0, 0.0), Action::Unchanged);
+        assert_eq!(ctrl.reconfigure(85.0, 75.0), Action::Unchanged);
+        assert_eq!(ctrl.thresholds(), Some((85, 75)));
         let u = parse_sysfs_vram("4294967296\n", "8589934592\n").expect("应能解析字节数");
         assert_eq!(u.used_mib, 4096);
         assert_eq!(u.total_mib, 8192);

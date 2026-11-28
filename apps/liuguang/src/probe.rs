@@ -138,7 +138,7 @@ const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 /// 从图片头解析尺寸（不认识就 `None`）。
 #[must_use]
 pub fn parse_image(buf: &[u8]) -> Option<MediaDetails> {
-    if buf.len() > 12 && buf[..8] == PNG_SIG && &buf[12..16] == b"IHDR" {
+    if buf.len() >= 16 && buf[..8] == PNG_SIG && &buf[12..16] == b"IHDR" {
         return parse_png(buf);
     }
     if buf.starts_with(&[0xFF, 0xD8]) {
@@ -304,10 +304,11 @@ fn probe_iso_bmff(mut file: File) -> Option<MediaDetails> {
         } else if small == 0 {
             box_len = file_len - at;
         }
-        if box_len < payload_at - at {
+        let header_len = payload_at - at;
+        if box_len < header_len || box_len > file_len.saturating_sub(at) {
             return None;
         }
-        let payload_len = box_len - (payload_at - at);
+        let payload_len = box_len - header_len;
         if &name == b"moov" {
             if payload_len > VIDEO_INDEX_BYTES {
                 return None;
@@ -317,7 +318,7 @@ fn probe_iso_bmff(mut file: File) -> Option<MediaDetails> {
             file.take(payload_len).read_to_end(&mut payload).ok()?;
             return parse_moov(&payload);
         }
-        at += box_len;
+        at = at.checked_add(box_len)?;
     }
     None
 }
@@ -339,7 +340,7 @@ fn find_box<'a>(buf: &'a [u8], name: &[u8; 4]) -> Option<&'a [u8]> {
         if len < payload_at - at || payload_at > buf.len() {
             return None;
         }
-        let end = (at + len).min(buf.len());
+        let end = at.saturating_add(len).min(buf.len());
         if this == name {
             return buf.get(payload_at..end);
         }
@@ -433,7 +434,7 @@ fn box_at(buf: &[u8], at: usize) -> Option<([u8; 4], &[u8], usize)> {
     if len < payload_at - at || payload_at > buf.len() {
         return None;
     }
-    let end = (at + len).min(buf.len());
+    let end = at.saturating_add(len).min(buf.len());
     Some((name, buf.get(payload_at..end)?, len))
 }
 
@@ -1082,5 +1083,37 @@ mod tests {
         file.extend_from_slice(&segment);
         let details = parse_mkv(&file).expect("8 字节 size（显式长度）也要解析出尺寸");
         assert_eq!(details.width, 1_920);
+    }
+
+    #[test]
+    fn truncated_png_13_to_15_bytes_does_not_panic() {
+        for len in 8..16 {
+            let mut buf = vec![0u8; len];
+            buf[..8].copy_from_slice(&PNG_SIG);
+            assert!(parse_image(&buf).is_none(), "len={len}");
+        }
+    }
+
+    #[test]
+    fn crafted_u64_max_iso_bmff_box_does_not_overflow_or_loop() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "liuguang-probe-bmff-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("bad.mp4");
+        let mut data = Vec::new();
+        // 8-byte ftyp box
+        data.extend_from_slice(&8u32.to_be_bytes());
+        data.extend_from_slice(b"ftyp");
+        // 16-byte box with small=1 and 64-bit size = u64::MAX - 7
+        data.extend_from_slice(&1u32.to_be_bytes());
+        data.extend_from_slice(b"free");
+        data.extend_from_slice(&(u64::MAX - 7).to_be_bytes());
+        std::fs::write(&path, &data).unwrap();
+        assert!(probe_video(&path).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

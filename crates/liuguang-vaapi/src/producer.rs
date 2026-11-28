@@ -263,7 +263,13 @@ impl SyncPipeline {
             inflight: Arc::clone(&self.surface_inflight),
         };
         let keepalive = Some(FrameKeepalive::new(guard));
-        let frame = exported_surface.into_frame(keepalive)?;
+        let mut frame = exported_surface.into_frame(keepalive)?;
+        // 硬件解码表面通常按 16 像素高度对齐（如 1080p -> 1920x1088），直通分支需裁剪回流可见尺寸，
+        // 避免合成器或 fit 按 1088 计算比例并在底部采样出 8 行未定义绿色填充像素。
+        if self.visible.0 > 0 && self.visible.1 > 0 {
+            frame.width = frame.width.min(self.visible.0);
+            frame.height = frame.height.min(self.visible.1);
+        }
         let exported_total = self.exported.fetch_add(1, Ordering::Relaxed) + 1;
         if exported_total == 1 {
             // 首个导出帧打一次完整信息：跨 GPU 场景下这条日志就是全部线索。

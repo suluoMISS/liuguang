@@ -26,16 +26,23 @@ pub struct IntervalScheduler {
     paused: bool,
 }
 
+/// 把 `interval` 叠加到 `base` 上，防止超大 `Duration` 触发 `Instant + Duration` 溢出 panic。
+fn safe_due(base: Instant, interval: Duration) -> Option<Instant> {
+    if interval.is_zero() {
+        return None;
+    }
+    const MAX_CAP: Duration = Duration::from_secs(31_536_000);
+    let clamped = interval.min(MAX_CAP);
+    base.checked_add(clamped)
+        .or_else(|| base.checked_add(Duration::from_secs(86_400)))
+}
+
 impl IntervalScheduler {
     /// 创建调度器，首次到期时刻为 `Instant::now() + interval`。
     ///
     /// `interval` 为 [`Duration::ZERO`] 时合法：见 [`Self::poll`] 的零间隔语义。
     pub fn new(interval: Duration) -> Self {
-        let next_due = if interval.is_zero() {
-            None
-        } else {
-            Some(Instant::now() + interval)
-        };
+        let next_due = safe_due(Instant::now(), interval);
         Self {
             interval,
             next_due,
@@ -46,11 +53,7 @@ impl IntervalScheduler {
     /// 修改轮换间隔，并从 `now` 重新排期（`interval` 为零时清除排期）。
     pub fn set_interval(&mut self, interval: Duration, now: Instant) {
         self.interval = interval;
-        self.next_due = if interval.is_zero() {
-            None
-        } else {
-            Some(now + interval)
-        };
+        self.next_due = safe_due(now, interval);
     }
 
     /// 暂停：[`Self::poll`] 恒返回 `false`，排期清除。
@@ -62,11 +65,7 @@ impl IntervalScheduler {
     /// 恢复：从 `now` 起按当前 `interval` 重新排期。
     pub fn resume(&mut self, now: Instant) {
         self.paused = false;
-        self.next_due = if self.interval.is_zero() {
-            None
-        } else {
-            Some(now + self.interval)
-        };
+        self.next_due = safe_due(now, self.interval);
     }
 
     /// 是否处于暂停状态。
@@ -94,13 +93,13 @@ impl IntervalScheduler {
         }
         match self.next_due {
             Some(due) if now >= due => {
-                self.next_due = Some(now + self.interval);
+                self.next_due = safe_due(now, self.interval);
                 true
             }
             Some(_) => false,
             None => {
                 // 未排期（零间隔之外的防御分支）：视为到期并排期。
-                self.next_due = Some(now + self.interval);
+                self.next_due = safe_due(now, self.interval);
                 true
             }
         }

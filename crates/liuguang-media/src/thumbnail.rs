@@ -195,32 +195,42 @@ pub fn scale_to_fit(src: Thumbnail, max_w: u32, max_h: u32) -> Thumbnail {
     if max_w == 0 || max_h == 0 || src.width == 0 || src.height == 0 {
         return src;
     }
+    let expected = (src.width as usize)
+        .checked_mul(src.height as usize)
+        .and_then(|px| px.checked_mul(4));
+    if expected.is_none_or(|need| src.rgba.len() < need) {
+        return src;
+    }
     let scale = (max_w as f64 / f64::from(src.width)).min(max_h as f64 / f64::from(src.height));
     if scale >= 1.0 {
         return src;
     }
     let dst_w = ((f64::from(src.width) * scale).round() as u32).max(1);
     let dst_h = ((f64::from(src.height) * scale).round() as u32).max(1);
-    let mut out = vec![0u8; (dst_w * dst_h * 4) as usize];
+    let mut out = vec![0u8; dst_w as usize * dst_h as usize * 4];
+    let src_w = u64::from(src.width);
+    let src_h = u64::from(src.height);
+    let dw = u64::from(dst_w);
+    let dh = u64::from(dst_h);
     // 面积平均：每个目标像素覆盖一个源矩形，避免缩小后出现摩尔纹。
-    for dy in 0..dst_h {
-        let y0 = dy * src.height / dst_h;
-        let y1 = (((dy + 1) * src.height).div_ceil(dst_h)).min(src.height);
-        for dx in 0..dst_w {
-            let x0 = dx * src.width / dst_w;
-            let x1 = (((dx + 1) * src.width).div_ceil(dst_w)).min(src.width);
+    for dy in 0..dh {
+        let y0 = dy * src_h / dh;
+        let y1 = ((dy + 1) * src_h).div_ceil(dh).min(src_h);
+        for dx in 0..dw {
+            let x0 = dx * src_w / dw;
+            let x1 = ((dx + 1) * src_w).div_ceil(dw).min(src_w);
             let mut sum = [0u32; 4];
             let mut count = 0u32;
             for sy in y0..y1.max(y0 + 1) {
                 for sx in x0..x1.max(x0 + 1) {
-                    let i = ((sy * src.width + sx) * 4) as usize;
+                    let i = ((sy * src_w + sx) * 4) as usize;
                     for (c, acc) in sum.iter_mut().enumerate() {
                         *acc += u32::from(src.rgba[i + c]);
                     }
                     count += 1;
                 }
             }
-            let o = ((dy * dst_w + dx) * 4) as usize;
+            let o = ((dy * dw + dx) * 4) as usize;
             for (c, acc) in sum.iter().enumerate() {
                 out[o + c] = u8::try_from(acc / count.max(1)).unwrap_or(0);
             }

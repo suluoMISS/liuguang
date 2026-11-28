@@ -365,20 +365,28 @@ impl TranscodePolicy {
 enum WorkerMsg {
     Progress {
         source: PathBuf,
+        job_id: u64,
         out_time_ms: i64,
     },
     Done {
         source: PathBuf,
+        job_id: u64,
         cache_path: PathBuf,
         stderr_tail: String,
     },
     Failed {
         source: PathBuf,
+        job_id: u64,
         message: String,
     },
 }
 
+const MAX_QUEUE_LEN: usize = 64;
+const MAX_FINISHED_JOBS: usize = 256;
+const MAX_STDOUT_LINE_BYTES: usize = 8192;
+
 struct Job {
+    id: u64,
     state: PrepareState,
     progress_permille: u32,
     cache_path: Option<PathBuf>,
@@ -386,6 +394,7 @@ struct Job {
     spec: JobSpec,
     started_at: Option<Instant>,
     cancel: Arc<AtomicBool>,
+    child_pid: Arc<Mutex<Option<u32>>>,
 }
 
 /// 后台转码器（单线程 worker + 队列；`Runtime` 每 tick 调 [`Transcoder::poll`]）。
@@ -398,6 +407,7 @@ pub struct Transcoder {
     profile_spec: String,
     /// `[media].transcode_max_width` 原值（按输出重算 profile 用）。
     profile_max_width: u32,
+    next_job_id: u64,
     jobs: HashMap<PathBuf, Job>,
     queue: VecDeque<PathBuf>,
     running: Option<PathBuf>,
@@ -409,10 +419,6 @@ pub struct Transcoder {
     config_value: String,
     /// 环境变量 `LIUGUANG_TRANSCODE` 的原值（`off` 会盖掉配置，文案要区分）。
     env_override: Option<String>,
-    /// 正在跑的 ffmpeg 进程组 id（`process_group(0)` ⇒ pgid == pid）。
-    ///
-    /// 退出/超时用它整组杀掉，避免 `SIGKILL` 之后 ffmpeg 孤儿继续写 `.part`。
-    child_pid: Arc<Mutex<Option<u32>>>,
 }
 
 impl Transcoder {
@@ -451,6 +457,7 @@ impl Transcoder {
             profile,
             profile_spec: profile_spec.to_string(),
             profile_max_width,
+            next_job_id: 1,
             jobs: HashMap::new(),
             queue: VecDeque::new(),
             running: None,
@@ -459,7 +466,6 @@ impl Transcoder {
             warned_missing: false,
             config_value: config_value.to_string(),
             env_override: env_override.map(str::to_string),
-            child_pid: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -549,14 +555,6 @@ impl Transcoder {
         cleanup_parts_in(&cache_dir())
     }
 
-    /// 杀掉正在跑的 ffmpeg 进程组（退出/超时用）。
-    fn kill_running(&self) {
-        let pid = self.child_pid.lock().ok().and_then(|guard| *guard);
-        if let Some(pid) = pid {
-            terminate_process_group(pid);
-        }
-    }
-
     /// 启动期默认 profile（日志/自检用；**不要**拿它算缓存 key —— 见 [`Self::profile_for`]）。
     pub fn profile(&self) -> &TranscodeProfile {
         &self.profile
@@ -627,6 +625,39 @@ impl Transcoder {
         })
     }
 
+    fn alloc_job_id(&mut self) -> u64 {
+        let id = self.next_job_id;
+        self.next_job_id = self.next_job_id.wrapping_add(1).max(1);
+        id
+    }
+
+    fn prune_finished_jobs(&mut self) {
+        if self.jobs.len() <= MAX_FINISHED_JOBS {
+            return;
+        }
+        let excess = self.jobs.len() - MAX_FINISHED_JOBS;
+        let removable: Vec<PathBuf> = self
+            .jobs
+            .iter()
+            .filter(|(p, j)| {
+                matches!(j.state, PrepareState::Ready | PrepareState::Failed)
+                    && self.running.as_ref() != Some(*p)
+            })
+            .take(excess)
+            .map(|(p, _)| p.clone())
+            .collect();
+        for p in removable {
+            self.jobs.remove(&p);
+        }
+    }
+
+    fn kill_running(&mut self) {
+        if let Some(job) = self.running.as_ref().and_then(|s| self.jobs.get(s)) {
+            let pgid = job.child_pid.lock().ok().and_then(|g| *g).unwrap_or(0);
+            terminate_process_group(pgid, Arc::clone(&job.child_pid));
+        }
+    }
+
     /// 缓存是否已经可用（`ready` + 文件还在 + **key 与当前源一致**）。
     ///
     /// key 里含源文件大小与 mtime（见 [`cache_key`]）：源文件被改动后必须重新转码，
@@ -652,9 +683,11 @@ impl Transcoder {
             } else {
                 self.missing_ffmpeg_message()
             };
+            let job_id = self.alloc_job_id();
             self.jobs.insert(
                 source.clone(),
                 Job {
+                    id: job_id,
                     state: PrepareState::Failed,
                     progress_permille: 0,
                     cache_path: None,
@@ -662,8 +695,10 @@ impl Transcoder {
                     spec,
                     started_at: None,
                     cancel: Arc::new(AtomicBool::new(false)),
+                    child_pid: Arc::new(Mutex::new(None)),
                 },
             );
+            self.prune_finished_jobs();
             return JobView {
                 state: PrepareState::Failed,
                 progress_permille: 0,
@@ -684,14 +719,14 @@ impl Transcoder {
                 source = %source.display(),
                 "源文件或转码参数已变（缓存 key 变化）：旧任务作废，重新排队"
             );
-            if let Some(old) = self.jobs.remove(&source) {
-                old.cancel.store(true, std::sync::atomic::Ordering::Release);
-            }
-            self.queue.retain(|item| item != &source);
             if self.running.as_ref() == Some(&source) {
                 self.kill_running();
                 self.running = None;
             }
+            if let Some(old) = self.jobs.remove(&source) {
+                old.cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+            self.queue.retain(|item| item != &source);
         }
 
         if let Some(job) = self.jobs.get(&source) {
@@ -716,9 +751,11 @@ impl Transcoder {
         if !force {
             if let Some(cached) = spec.cache_path.exists().then(|| spec.cache_path.clone()) {
                 // 缓存已经在磁盘上（daemon 重启过）：直接可用，不必再转。
+                let job_id = self.alloc_job_id();
                 self.jobs.insert(
                     source.clone(),
                     Job {
+                        id: job_id,
                         state: PrepareState::Ready,
                         progress_permille: 1000,
                         cache_path: Some(cached.clone()),
@@ -726,8 +763,10 @@ impl Transcoder {
                         spec,
                         started_at: None,
                         cancel: Arc::new(AtomicBool::new(false)),
+                        child_pid: Arc::new(Mutex::new(None)),
                     },
                 );
+                self.prune_finished_jobs();
                 return JobView {
                     state: PrepareState::Ready,
                     progress_permille: 1000,
@@ -739,10 +778,28 @@ impl Transcoder {
 
         if let Some(pos) = self.queue.iter().position(|item| item == &source) {
             self.queue.remove(pos);
+        } else if self.queue.len() >= MAX_QUEUE_LEN {
+            return JobView {
+                state: PrepareState::Failed,
+                progress_permille: 0,
+                cache_path: None,
+                message: Some(format!(
+                    "转码队列已满（上限 {MAX_QUEUE_LEN} 项），请稍后再试"
+                )),
+            };
         }
+        if self.running.as_ref() == Some(&source) {
+            self.kill_running();
+            self.running = None;
+        }
+        if let Some(old) = self.jobs.get(&source) {
+            old.cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+        let job_id = self.alloc_job_id();
         self.jobs.insert(
             source.clone(),
             Job {
+                id: job_id,
                 state: PrepareState::Queued,
                 progress_permille: 0,
                 cache_path: None,
@@ -750,8 +807,10 @@ impl Transcoder {
                 spec,
                 started_at: None,
                 cancel: Arc::new(AtomicBool::new(false)),
+                child_pid: Arc::new(Mutex::new(None)),
             },
         );
+        self.prune_finished_jobs();
         self.queue.push_back(source.clone());
         self.pump();
         // `pump` 可能已经把任务推进到 running/failed，所以按 jobs 里的真实状态回答；
@@ -784,8 +843,11 @@ impl Transcoder {
             return;
         };
         let spec = job.spec.clone();
+        let job_id = job.id;
         let cancel = Arc::new(AtomicBool::new(false));
+        let child_pid = Arc::new(Mutex::new(None));
         job.cancel = Arc::clone(&cancel);
+        job.child_pid = Arc::clone(&child_pid);
         job.state = PrepareState::Running;
         job.progress_permille = 0;
         job.started_at = Some(Instant::now());
@@ -796,11 +858,10 @@ impl Transcoder {
         };
         let profile = spec.profile.clone();
         let tx = self.tx.clone();
-        let child_pid = Arc::clone(&self.child_pid);
         self.running = Some(source.clone());
         if let Err(err) = std::thread::Builder::new()
             .name("liuguang-transcode".to_string())
-            .spawn(move || worker(program, profile, spec, tx, child_pid, cancel))
+            .spawn(move || worker(program, profile, spec, job_id, tx, child_pid, cancel))
         {
             self.running = None;
             if let Some(job) = self.jobs.get_mut(&source) {
@@ -818,9 +879,12 @@ impl Transcoder {
             match message {
                 WorkerMsg::Progress {
                     source,
+                    job_id,
                     out_time_ms,
                 } => {
-                    if let Some(job) = self.jobs.get_mut(&source) {
+                    if let Some(job) = self.jobs.get_mut(&source)
+                        && job.id == job_id
+                    {
                         job.progress_permille =
                             progress_permille(out_time_ms, job.spec.duration_ms);
                         job.state = PrepareState::Running;
@@ -828,18 +892,20 @@ impl Transcoder {
                 }
                 WorkerMsg::Done {
                     source,
+                    job_id,
                     cache_path,
                     stderr_tail,
                 } => {
-                    if self.running.as_ref() == Some(&source) {
+                    let matches_id = self.jobs.get(&source).is_some_and(|job| job.id == job_id);
+                    if self.running.as_ref() == Some(&source) && matches_id {
                         self.running = None;
                     }
-                    let is_current = self
-                        .jobs
-                        .get(&source)
-                        .is_some_and(|job| !job.cancel.load(std::sync::atomic::Ordering::Acquire));
+                    let is_current = matches_id
+                        && self.jobs.get(&source).is_some_and(|job| {
+                            !job.cancel.load(std::sync::atomic::Ordering::Acquire)
+                        });
                     if !is_current {
-                        tracing::debug!(source = %source.display(), "忽略已作废转码任务的完成消息");
+                        tracing::debug!(source = %source.display(), job_id, "忽略已作废转码任务的完成消息");
                         continue;
                     }
                     if let Some(job) = self.jobs.get_mut(&source) {
@@ -855,9 +921,18 @@ impl Transcoder {
                     tracing::info!(source = %source.display(), cache = %cache_path.display(), "转码完成");
                     events.push(TranscodeEvent::Finished { source, cache_path });
                 }
-                WorkerMsg::Failed { source, message } => {
-                    if self.running.as_ref() == Some(&source) {
+                WorkerMsg::Failed {
+                    source,
+                    job_id,
+                    message,
+                } => {
+                    let matches_id = self.jobs.get(&source).is_some_and(|job| job.id == job_id);
+                    if self.running.as_ref() == Some(&source) && matches_id {
                         self.running = None;
+                    }
+                    if !matches_id {
+                        tracing::debug!(source = %source.display(), job_id, "忽略旧转码任务的失败消息");
+                        continue;
                     }
                     let already_failed = self
                         .jobs
@@ -910,13 +985,8 @@ impl Transcoder {
                     job.started_at = None;
                     // 只标失败不杀进程 = 孤儿继续写 .part（t21 F6）：整组杀掉。
                     let part = job.spec.part_path();
-                    terminate_process_group(
-                        self.child_pid
-                            .lock()
-                            .ok()
-                            .and_then(|guard| *guard)
-                            .unwrap_or(0),
-                    );
+                    let pgid = job.child_pid.lock().ok().and_then(|g| *g).unwrap_or(0);
+                    terminate_process_group(pgid, Arc::clone(&job.child_pid));
                     let _ = std::fs::remove_file(&part);
                 }
                 self.running = None;
@@ -985,7 +1055,7 @@ fn cleanup_parts_in(dir: &Path) -> usize {
 ///
 /// 用 `kill` 命令而不是 `libc::kill`：workspace 的 `unsafe_code = "forbid"` 不允许
 /// 直接 FFI，而子进程是用 `process_group(0)` 起的 ⇒ `-<pgid>` 就是它自己那一组。
-fn terminate_process_group(pgid: u32) {
+fn terminate_process_group(pgid: u32, pid_slot: Arc<Mutex<Option<u32>>>) {
     if pgid == 0 {
         return;
     }
@@ -1000,10 +1070,13 @@ fn terminate_process_group(pgid: u32) {
         .name("liuguang-transcode-reaper".to_string())
         .spawn(move || {
             std::thread::sleep(Duration::from_millis(800));
-            let _ = Command::new("kill")
-                .arg("-KILL")
-                .arg(format!("-{pgid}"))
-                .status();
+            // 只有原任务尚未完成 child.wait() 时才补 SIGKILL，杜绝 PID 回收误杀无关进程组。
+            if pid_slot.lock().ok().and_then(|g| *g) == Some(pgid) {
+                let _ = Command::new("kill")
+                    .arg("-KILL")
+                    .arg(format!("-{pgid}"))
+                    .status();
+            }
         })
         .ok();
 }
@@ -1013,6 +1086,7 @@ fn worker(
     program: String,
     profile: TranscodeProfile,
     spec: JobSpec,
+    job_id: u64,
     tx: Sender<WorkerMsg>,
     child_pid: Arc<Mutex<Option<u32>>>,
     cancel: Arc<AtomicBool>,
@@ -1026,7 +1100,7 @@ fn worker(
         if cancel.load(std::sync::atomic::Ordering::Acquire) {
             break;
         }
-        match run_ffmpeg(&program, &profile, &spec, &encoder, &tx, &child_pid) {
+        match run_ffmpeg(&program, &profile, &spec, job_id, &encoder, &tx, &child_pid) {
             Ok(stderr_tail) => {
                 if cancel.load(std::sync::atomic::Ordering::Acquire) {
                     let _ = std::fs::remove_file(spec.part_path());
@@ -1035,12 +1109,14 @@ fn worker(
                 if rename_part(&spec).is_ok() {
                     let _ = tx.send(WorkerMsg::Done {
                         source: spec.source.clone(),
+                        job_id,
                         cache_path: spec.cache_path.clone(),
                         stderr_tail,
                     });
                 } else {
                     let _ = tx.send(WorkerMsg::Failed {
                         source: spec.source.clone(),
+                        job_id,
                         message: format!(
                             "转码完成但无法写入缓存 {}：请检查磁盘空间与目录权限",
                             spec.cache_path.display()
@@ -1061,6 +1137,7 @@ fn worker(
     }
     let _ = tx.send(WorkerMsg::Failed {
         source: spec.source.clone(),
+        job_id,
         message: format!(
             "自动转换失败（{}）：{last_error}\n\
              可尝试：把 [media].transcode_crf_or_bitrate 改成 `libx265 -crf 20`（纯 CPU 编码），\
@@ -1075,6 +1152,7 @@ fn run_ffmpeg(
     program: &str,
     profile: &TranscodeProfile,
     spec: &JobSpec,
+    job_id: u64,
     encoder: &str,
     tx: &Sender<WorkerMsg>,
     child_pid: &Arc<Mutex<Option<u32>>>,
@@ -1112,19 +1190,18 @@ fn run_ffmpeg(
         *slot = Some(pid);
     }
 
-    // stderr 单独读（尾部 4KB），否则管道写满会让 ffmpeg 卡死。
+    // stderr 单独读（固定块读入尾部 4KB，避免长行 OOM），否则管道写满会让 ffmpeg 卡死。
     let stderr = child.stderr.take();
-    let stderr_handle = stderr.map(|stderr| {
+    let stderr_handle = stderr.map(|mut stderr| {
         std::thread::spawn(move || {
+            use std::io::Read as _;
             let mut tail = Vec::new();
-            let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
+            let mut chunk = [0u8; 4096];
             loop {
-                line.clear();
-                match reader.read_line(&mut line) {
+                match stderr.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        tail.extend_from_slice(line.as_bytes());
+                    Ok(n) => {
+                        tail.extend_from_slice(&chunk[..n]);
                         if tail.len() > STDERR_TAIL_BYTES {
                             let cut = tail.len() - STDERR_TAIL_BYTES;
                             tail.drain(..cut);
@@ -1138,26 +1215,31 @@ fn run_ffmpeg(
 
     let stdout = child.stdout.take();
     if let Some(stdout) = stdout {
+        use std::io::Read as _;
         let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
+        let mut buf = Vec::with_capacity(256);
         let mut last_sent = Instant::now()
             .checked_sub(PROGRESS_INTERVAL)
             .unwrap_or_else(Instant::now);
         loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    if let Some(out_time_ms) = parse_out_time_ms(&line) {
-                        if last_sent.elapsed() >= PROGRESS_INTERVAL {
-                            last_sent = Instant::now();
-                            let _ = tx.send(WorkerMsg::Progress {
-                                source: spec.source.clone(),
-                                out_time_ms,
-                            });
-                        }
-                    }
-                }
+            buf.clear();
+            let n = (&mut reader)
+                .take(MAX_STDOUT_LINE_BYTES as u64)
+                .read_until(b'\n', &mut buf)
+                .unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            if let Ok(line) = std::str::from_utf8(&buf)
+                && let Some(out_time_ms) = parse_out_time_ms(line)
+                && last_sent.elapsed() >= PROGRESS_INTERVAL
+            {
+                last_sent = Instant::now();
+                let _ = tx.send(WorkerMsg::Progress {
+                    source: spec.source.clone(),
+                    job_id,
+                    out_time_ms,
+                });
             }
         }
     }
@@ -1833,6 +1915,7 @@ mod tests {
             "/nonexistent/ffmpeg".to_string(),
             profile(),
             job,
+            1,
             tx,
             Arc::new(Mutex::new(None)),
             Arc::new(AtomicBool::new(false)),

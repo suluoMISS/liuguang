@@ -86,7 +86,10 @@ chmod 0644 %{buildroot}%{_unitdir}/liuguang.service
 install -d %{buildroot}%{_sysusersdir}
 install -m 0644 packaging/liuguang.sysusers %{buildroot}%{_sysusersdir}/liuguang.conf
 
-# 默认启用（fresh install 时 systemd_post 宏会执行 systemctl preset）。
+install -d %{buildroot}%{_tmpfilesdir}
+install -m 0644 packaging/liuguang.tmpfiles %{buildroot}%{_tmpfilesdir}/liuguang.conf
+
+# 默认禁用系统服务（desktop 走用户单元；无头展示机由管理员显式 enable --now）。
 install -d %{buildroot}%{_prefix}/lib/systemd/system-preset
 install -m 0644 packaging/liuguang.preset %{buildroot}%{_prefix}/lib/systemd/system-preset/90-liuguang.preset
 
@@ -115,12 +118,7 @@ install -d %{buildroot}/srv/wallpapers/videos
 
 %post
 %systemd_post liuguang.service
-if [ "$1" -eq 1 ]; then
-    # 首次安装：preset/systemd_post 宏只 enable 不 start（systemd-update-helper
-    # install-system-units 语义），而"装完即用"是装饰屏的产品预期。
-    # --no-block 避免 rpm 事务被服务启动阻塞；失败不阻断安装，管理员可手动 start。
-    systemctl --no-block start liuguang.service >/dev/null 2>&1 || :
-fi
+%tmpfiles_create_compat %{_tmpfilesdir}/liuguang.conf
 
 %preun
 %systemd_preun liuguang.service
@@ -148,6 +146,7 @@ fi
 %{_bindir}/liuguang
 %{_unitdir}/liuguang.service
 %{_sysusersdir}/liuguang.conf
+%{_tmpfilesdir}/liuguang.conf
 %{_prefix}/lib/systemd/system-preset/90-liuguang.preset
 %dir %{_sysconfdir}/liuguang
 %config(noreplace) %{_sysconfdir}/liuguang/config.toml

@@ -1859,11 +1859,13 @@ fn handle_update(app: &Rc<App>, update: Upd) {
                     app.resume_watch.set(None);
                 }
             }
-            if let Some((path, at)) = app.apply_watch.borrow().as_ref() {
-                if at.elapsed() > Duration::from_secs(10) {
-                    let _ = path;
-                    app.apply_watch.borrow_mut().take();
-                }
+            let apply_expired = app
+                .apply_watch
+                .borrow()
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(10));
+            if apply_expired {
+                app.apply_watch.borrow_mut().take();
             }
             // 转码完成后的重试等到这里才做：先看新状态里 daemon 是不是已经自动播了缓存
             // （必须等到 scheduled `ready_at` 之后，避免 1s 心跳 Status 抢先消费）。

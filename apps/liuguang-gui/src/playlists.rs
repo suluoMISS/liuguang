@@ -535,7 +535,8 @@ pub fn refresh(app: &Rc<App>, view: &Rc<PlaylistsView>) {
     sync_outputs(app, view);
 
     // 当前编辑的播放列表被删掉了 ⇒ 清空编辑器；若仍在且未标脏，同步守护进程最新内容。
-    if let Some(current) = view.current.borrow().clone() {
+    let current = view.current.borrow().clone();
+    if let Some(current) = current {
         if !playlists.iter().any(|p| p.id == current) {
             view.current.borrow_mut().take();
             view.dirty.set(false);

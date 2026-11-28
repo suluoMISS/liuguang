@@ -2116,21 +2116,19 @@ impl drm::buffer::PlanarBuffer for DmaBufPlanar {
         self.modifier
     }
     fn pitches(&self) -> [u32; 4] {
-        if self.planes >= 2 {
-            [self.strides[0], self.strides[1], 0, 0]
-        } else {
-            [self.strides[0], 0, 0, 0]
-        }
+        let mut out = [0u32; 4];
+        let count = usize::try_from(self.planes).unwrap_or(0).min(4);
+        out[..count].copy_from_slice(&self.strides[..count]);
+        out
     }
     fn handles(&self) -> [Option<drm::buffer::Handle>; 4] {
         self.gems
     }
     fn offsets(&self) -> [u32; 4] {
-        if self.planes >= 2 {
-            [self.offsets[0], self.offsets[1], 0, 0]
-        } else {
-            [self.offsets[0], 0, 0, 0]
-        }
+        let mut out = [0u32; 4];
+        let count = usize::try_from(self.planes).unwrap_or(0).min(4);
+        out[..count].copy_from_slice(&self.offsets[..count]);
+        out
     }
 }
 
@@ -2477,11 +2475,12 @@ impl DrmKmsBackend {
         // 未知格式按打包处理并让内核做最终判定。
         let planes = plane_count_for(fourcc);
         if planes >= 2 {
-            // 半平面/I420 时后续平面的 stride/offset 必须可用；单 object 假设必须成立
-            // （多 object DMA-BUF 无法用当前 DmaBufFrame 表达，明确报错而不是误画）。
-            // **3 平面（I420）还要检查第三个平面**——少一个平面内核会 EINVAL 或画错。
-            let bad =
-                (1..planes as usize).find(|i| frame.strides[*i] == 0 || frame.offsets[*i] == 0);
+            // 多平面格式每平面必须有有效 stride；单 object 打包时的后续平面 offset 必须非 0，
+            // 而多 object（每个平面独立 dma-buf fd）的后续平面 offset 允许为 0。
+            let bad = (1..planes as usize).find(|i| {
+                frame.strides[*i] == 0
+                    || (frame.object_index[*i] == frame.object_index[0] && frame.offsets[*i] == 0)
+            });
             if let Some(i) = bad {
                 self.destroy_gems(&imported);
                 return Err(DisplayError::DmaBufRejected {

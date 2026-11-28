@@ -74,6 +74,7 @@ fn rgba_converter_for(decoder_element: &str, vapostproc_available: bool) -> &'st
 /// 残留 `qtdemux` 线程，所以失败路径也必须显式收尾。
 struct PipelineGuard {
     pipeline: Option<gst::Pipeline>,
+    pad_added: Option<(gst::Element, gst::glib::SignalHandlerId)>,
 }
 
 impl PipelineGuard {
@@ -81,7 +82,13 @@ impl PipelineGuard {
     fn new() -> Self {
         Self {
             pipeline: Some(gst::Pipeline::new()),
+            pad_added: None,
         }
+    }
+
+    /// 登记动态 pad 回调句柄：异常回滚时先解绑信号，避免持有 `parse_sink` 强引用。
+    fn attach_pad_added(&mut self, demux: gst::Element, id: gst::glib::SignalHandlerId) {
+        self.pad_added = Some((demux, id));
     }
 
     /// 借用内部管线。
@@ -91,14 +98,24 @@ impl PipelineGuard {
 
     /// 解除守卫并交出管线（成功路径）。
     fn disarm(mut self) -> gst::Pipeline {
+        self.pad_added = None;
         self.pipeline.take().unwrap_or_default()
+    }
+
+    /// 取出已登记的 `pad_added` 句柄（成功交接给播放器时使用）。
+    fn take_pad_added(&mut self) -> Option<gst::glib::SignalHandlerId> {
+        self.pad_added.take().map(|(_, id)| id)
     }
 }
 
 impl Drop for PipelineGuard {
     fn drop(&mut self) {
+        if let Some((demux, id)) = self.pad_added.take() {
+            demux.disconnect(id);
+        }
         if let Some(pipeline) = self.pipeline.take() {
             let _ = pipeline.set_state(gst::State::Null);
+            let _ = pipeline.state(gst::ClockTime::from_mseconds(250));
         }
     }
 }
@@ -756,9 +773,10 @@ impl GstProducer {
         };
 
         // 错误路径守卫：任何提前返回都把管线切到 NULL，停掉 qtdemux 等流线程。
-        let guard = PipelineGuard::new();
+        let mut guard = PipelineGuard::new();
         let pipeline = guard
             .pipeline()
+            .cloned()
             .ok_or_else(|| MediaError::Decode("解码管线已释放".into()))?;
 
         let filesrc = make("filesrc")?;
@@ -982,12 +1000,13 @@ impl GstProducer {
             }
             let _ = src_pad.link(&parse_sink);
         });
+        guard.attach_pad_added(demux.clone(), pad_added);
 
         pipeline
             .set_state(gst::State::Paused)
             .map_err(|e| MediaError::Decode(format!("解码管线进入 Paused 失败: {e}")))?;
 
-        let caps = wait_for_video_caps(pipeline, &appsink, PREROLL_TIMEOUT, dmabuf)?;
+        let caps = wait_for_video_caps(&pipeline, &appsink, PREROLL_TIMEOUT, dmabuf)?;
 
         // **t93**：现在 `caps` 是**协商后的完整 caps**（含 width/height/framerate）——
         // 用它配置自有池，`gst_video_info_from_caps()` 才能成功。
@@ -1053,11 +1072,12 @@ impl GstProducer {
         };
 
         let has_eos_property = appsink.find_property("eos").is_some();
+        let pad_added = guard.take_pad_added();
         Ok(Self {
             pipeline: guard.disarm(),
             appsink,
             demux,
-            pad_added: Some(pad_added),
+            pad_added,
             video_info,
             info,
             decoder_kind: choice.kind,
@@ -1192,8 +1212,15 @@ impl GstProducer {
             // 会少一行（ceil(height/2) > height/2），max(y,uv) stride 也可能大于
             // 任一源平面。
             let total = stride
-                .saturating_mul(height as usize)
-                .saturating_add(stride.saturating_mul(uv_rows));
+                .checked_mul(height as usize)
+                .and_then(|y| stride.checked_mul(uv_rows).and_then(|uv| y.checked_add(uv)))
+                .ok_or_else(|| MediaError::Decode("NV12 帧缓冲尺寸溢出".into()))?;
+            if total > crate::png_load::MAX_PNG_DECODED_BYTES {
+                return Err(MediaError::Decode(format!(
+                    "NV12 解码帧过大: {total}B > {}B",
+                    crate::png_load::MAX_PNG_DECODED_BYTES
+                )));
+            }
             let mut out = Vec::with_capacity(total);
             append_plane(
                 &mut out,
@@ -1245,7 +1272,15 @@ impl GstProducer {
         self.last_map_ms = map_started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
         let copy_started = Instant::now();
         // 同样不清零：`with_capacity` + extend 只写真实数据（每帧省一次全帧写）。
-        let total = row_bytes.saturating_mul(height as usize);
+        let total = row_bytes
+            .checked_mul(height as usize)
+            .ok_or_else(|| MediaError::Decode("RGBA 帧缓冲尺寸溢出".into()))?;
+        if total > crate::png_load::MAX_PNG_DECODED_BYTES {
+            return Err(MediaError::Decode(format!(
+                "RGBA 解码帧过大: {total}B > {}B",
+                crate::png_load::MAX_PNG_DECODED_BYTES
+            )));
+        }
         let mut out = Vec::with_capacity(total);
         append_plane(
             &mut out,
@@ -1318,12 +1353,19 @@ impl GstProducer {
             drm_format_normalized.as_str()
         };
         let (fourcc, modifier) = parse_drm_format(drm_format_ref)?;
-        let width = s
+        let raw_w = s
             .get::<i32>("width")
-            .map_err(|_| MediaError::Decode("caps 缺少 width".into()))? as u32;
-        let height =
-            s.get::<i32>("height")
-                .map_err(|_| MediaError::Decode("caps 缺少 height".into()))? as u32;
+            .map_err(|_| MediaError::Decode("caps 缺少 width".into()))?;
+        let raw_h = s
+            .get::<i32>("height")
+            .map_err(|_| MediaError::Decode("caps 缺少 height".into()))?;
+        if raw_w <= 0 || raw_h <= 0 {
+            return Err(MediaError::Decode(format!(
+                "caps 视频尺寸非法: {raw_w}x{raw_h}"
+            )));
+        }
+        let width = raw_w as u32;
+        let height = raw_h as u32;
 
         // 2. 平面布局（VideoMeta）。
         let meta = buffer
@@ -1648,6 +1690,9 @@ fn copy_plane(
 #[allow(unsafe_code)]
 fn dup_fd(raw: std::os::unix::io::RawFd) -> Result<std::os::fd::OwnedFd, MediaError> {
     use std::os::fd::BorrowedFd;
+    if raw < 0 {
+        return Err(MediaError::Decode(format!("非法的 DMA-BUF fd: {raw}")));
+    }
     let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
     borrowed
         .try_clone_to_owned()

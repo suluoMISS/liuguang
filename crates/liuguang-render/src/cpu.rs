@@ -43,7 +43,10 @@ pub fn render_fit(
             height: oh,
         });
     }
-    let stride = ow * 4;
+    let stride = ow.checked_mul(4).ok_or(RenderError::OutputTooLarge {
+        needed: u64::MAX,
+        limit: MAX_OUTPUT_BYTES as u64,
+    })?;
     let needed = (stride as usize)
         .checked_mul(oh as usize)
         .ok_or(RenderError::OutputTooLarge {

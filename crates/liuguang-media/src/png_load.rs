@@ -167,9 +167,9 @@ pub fn load_png_fitted(
     let mut reader = decoder
         .read_info()
         .map_err(|e| decode_err(path, "读取 PNG 头", e))?;
-    let (width, height) = {
+    let (width, height, interlaced) = {
         let info = reader.info();
-        (info.width, info.height)
+        (info.width, info.height, info.interlaced)
     };
     check_image_budget(width, height)?;
 
@@ -212,44 +212,98 @@ pub fn load_png_fitted(
         .collect();
     let mut acc = vec![0u64; out_width as usize * 4];
     let mut rows_in_block: u32 = 0;
+    let mut in_row: u32 = 0;
     let mut out_row: u32 = 0;
-    loop {
-        match reader.next_row() {
-            Ok(Some(row)) => {
-                let data = &row.data()[..row_bytes];
-                for (x, px) in data.chunks_exact(bpp).enumerate() {
-                    let (r, g, b, a) = match bpp {
-                        4 => (px[0], px[1], px[2], px[3]),
-                        3 => (px[0], px[1], px[2], 255),
-                        2 => (px[0], px[0], px[0], px[1]),
-                        _ => (px[0], px[0], px[0], 255),
-                    };
-                    let ox = (x as u32 / step) as usize;
-                    acc[ox * 4] += u64::from(r);
-                    acc[ox * 4 + 1] += u64::from(g);
-                    acc[ox * 4 + 2] += u64::from(b);
-                    acc[ox * 4 + 3] += u64::from(a);
-                }
-                rows_in_block += 1;
-                if rows_in_block == step || out_row + 1 == out_height {
-                    let base = out_row as usize * out_width as usize * 4;
-                    for ox in 0..out_width as usize {
-                        let n = u64::from(col_counts[ox]) * u64::from(rows_in_block);
-                        let n = n.max(1);
-                        for c in 0..4 {
-                            out[base + ox * 4 + c] = (acc[ox * 4 + c] / n) as u8;
-                        }
-                    }
-                    acc.fill(0);
-                    rows_in_block = 0;
-                    out_row += 1;
+
+    let accumulate_row = |data: &[u8], acc: &mut [u64]| {
+        for (x, px) in data.chunks_exact(bpp).enumerate() {
+            let (r, g, b, a) = match bpp {
+                4 => (px[0], px[1], px[2], px[3]),
+                3 => (px[0], px[1], px[2], 255),
+                2 => (px[0], px[0], px[0], px[1]),
+                _ => (px[0], px[0], px[0], 255),
+            };
+            let ox = (x as u32 / step) as usize;
+            acc[ox * 4] += u64::from(r);
+            acc[ox * 4 + 1] += u64::from(g);
+            acc[ox * 4 + 2] += u64::from(b);
+            acc[ox * 4 + 3] += u64::from(a);
+        }
+    };
+
+    let flush_block =
+        |acc: &mut [u64], rows_in_block: &mut u32, out_row: &mut u32, out: &mut [u8]| {
+            if *out_row >= out_height || *rows_in_block == 0 {
+                return;
+            }
+            let base = *out_row as usize * out_width as usize * 4;
+            for ox in 0..out_width as usize {
+                let n = u64::from(col_counts[ox]) * u64::from(*rows_in_block);
+                let n = n.max(1);
+                for c in 0..4 {
+                    out[base + ox * 4 + c] = (acc[ox * 4 + c] / n) as u8;
                 }
             }
-            Ok(None) => break,
-            Err(e) => return Err(decode_err(path, "解码像素数据", e)),
+            acc.fill(0);
+            *rows_in_block = 0;
+            *out_row += 1;
+        };
+
+    if interlaced {
+        // Adam7 隔行扫描：`next_row()` 按 pass 返回更短的局部行，必须用 `next_frame()` 先反隔行。
+        let buf_len = reader
+            .output_buffer_size()
+            .ok_or_else(|| MediaError::Decode(format!("PNG 缓冲大小未知: {}", path.display())))?;
+        if buf_len > MAX_PNG_DECODED_BYTES {
+            return Err(MediaError::DecodedTooLarge {
+                needed: buf_len as u64,
+                limit: MAX_PNG_DECODED_BYTES as u64,
+            });
+        }
+        let mut full = vec![0u8; buf_len];
+        let frame_info = reader
+            .next_frame(&mut full)
+            .map_err(|e| decode_err(path, "解码隔行 PNG 像素", e))?;
+        let needed = frame_info.buffer_size();
+        let src = full.get(..needed).ok_or_else(|| {
+            MediaError::Decode(format!("隔行 PNG 像素长度不足: {}", path.display()))
+        })?;
+        for y in 0..height {
+            let start = y as usize * row_bytes;
+            let row = src.get(start..start + row_bytes).ok_or_else(|| {
+                MediaError::Decode(format!("隔行 PNG 行数据截断: {}", path.display()))
+            })?;
+            accumulate_row(row, &mut acc);
+            rows_in_block += 1;
+            if rows_in_block == step || y + 1 == height {
+                flush_block(&mut acc, &mut rows_in_block, &mut out_row, &mut out);
+            }
+            in_row += 1;
+        }
+    } else {
+        loop {
+            match reader.next_row() {
+                Ok(Some(row)) => {
+                    let data = row.data().get(..row_bytes).ok_or_else(|| {
+                        MediaError::Decode(format!(
+                            "PNG 行数据长度不足（{}）: 期望至少 {row_bytes}，实际 {}",
+                            path.display(),
+                            row.data().len()
+                        ))
+                    })?;
+                    accumulate_row(data, &mut acc);
+                    rows_in_block += 1;
+                    if rows_in_block == step || in_row + 1 == height {
+                        flush_block(&mut acc, &mut rows_in_block, &mut out_row, &mut out);
+                    }
+                    in_row += 1;
+                }
+                Ok(None) => break,
+                Err(e) => return Err(decode_err(path, "解码像素数据", e)),
+            }
         }
     }
-    if out_row != out_height {
+    if in_row != height || out_row != out_height {
         return Err(MediaError::Decode(format!(
             "PNG 行数不符（{}）: 期望 {out_height} 行，实际 {}",
             path.display(),
@@ -504,5 +558,52 @@ mod tests {
     fn media_info_companion_types_still_work() {
         // 防止未来重构误删 MediaKind 关联（load_png 产物将喂给 MediaSource）。
         let _ = MediaKind::Image;
+    }
+
+    #[test]
+    fn load_png_fitted_handles_adam7_interlaced() {
+        // 标准 9x5 RGBA=(42, 42, 42, 42) Adam7 交错 PNG（png 0.18 Encoder 不内置 Adam7 编码）。
+        const ADAM7_9X5_RGBA42: &[u8] = &[
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 9, 0, 0, 0, 5,
+            8, 6, 0, 0, 1, 224, 84, 246, 253, 0, 0, 0, 27, 73, 68, 65, 84, 120, 156, 99, 208, 130,
+            2, 6, 56, 129, 34, 130, 157, 129, 85, 25, 5, 2, 68, 153, 139, 13, 0, 0, 211, 177, 29,
+            137, 143, 110, 173, 51, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ];
+        let path = temp_path("adam7");
+        std::fs::write(&path, ADAM7_9X5_RGBA42).unwrap();
+
+        let frame = load_png_fitted(&path, 5, 3).unwrap();
+        assert_eq!(frame.width, 5);
+        assert_eq!(frame.height, 3);
+        assert!(frame.data.iter().all(|&b| b == 42));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_png_fitted_averages_all_rows_in_last_block() {
+        let path = temp_path("last_block");
+        // 4x4，fit 到 2x2 ⇒ step=2。旧实现第 3 行就提前 flush，把第 4 行丢掉。
+        let mut pixels = Vec::with_capacity(4 * 4 * 4);
+        for y in 0..4u8 {
+            let v = if y < 2 {
+                10
+            } else if y == 2 {
+                0
+            } else {
+                200
+            };
+            for _ in 0..4 {
+                pixels.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        write_png(&path, 4, 4, png::ColorType::Rgba, &pixels);
+        let frame = load_png_fitted(&path, 2, 2).unwrap();
+        assert_eq!((frame.width, frame.height), (2, 2));
+        // 第 2 输出行应是第 2/3 行平均值 (0 + 200) / 2 = 100
+        assert_eq!(
+            &frame.data[frame.stride as usize..frame.stride as usize + 3],
+            &[100, 100, 100]
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

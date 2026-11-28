@@ -83,8 +83,9 @@ pub fn decide(readings: &[ConnectorReading]) -> ScreenState {
 #[derive(Debug)]
 pub struct DisplayPower {
     enabled: bool,
-    /// 连接器目录（`/sys/class/drm/card1-DP-1`）。启动时枚举一次即可：
-    /// 连接器不会在运行中增删（热插只改 `status`，不改目录集合）。
+    /// 可选的连接器发现根目录（`/sys/class/drm`）；热插拔/雷电坞接入时动态刷新。
+    drm_dir: Option<PathBuf>,
+    /// 连接器目录（`/sys/class/drm/card1-DP-1`）。
     connectors: Vec<PathBuf>,
     last_state: Option<ScreenState>,
     last_poll: Option<Instant>,
@@ -96,18 +97,14 @@ impl DisplayPower {
     /// 按配置构造。`enabled == false` 时 [`Self::refresh`] 恒返回 `None`（零开销）。
     #[must_use]
     pub fn new(enabled: bool) -> Self {
-        // 单测里不读宿主机真实 sysfs（`cfg!(test)`）：CI / 远程会话里屏幕可能正好
-        // 处于 DPMS Off，视频通道会被"熄屏暂停"停掉，`presented_ok` 恒 0，测试
-        // 结果会随机器当前的屏幕状态漂移。空连接器 ⇒ `decide(&[])` ⇒ `On`
-        // （"读不到任何信号就不暂停"，与模块口径一致）；真实枚举逻辑由
-        // `enumerate_connectors` / `decide` 的 temp-dir 单测覆盖。
-        let connectors = if enabled && !cfg!(test) {
-            enumerate_connectors(Path::new(DRM_CLASS_DIR))
-        } else {
-            Vec::new()
+        let drm_dir = (!cfg!(test)).then(|| PathBuf::from(DRM_CLASS_DIR));
+        let connectors = match (&drm_dir, enabled) {
+            (Some(dir), true) => enumerate_connectors(dir),
+            _ => Vec::new(),
         };
         Self {
             enabled,
+            drm_dir,
             connectors,
             last_state: None,
             last_poll: None,
@@ -122,6 +119,7 @@ impl DisplayPower {
     pub fn with_connectors(enabled: bool, connectors: Vec<PathBuf>) -> Self {
         Self {
             enabled,
+            drm_dir: None,
             connectors,
             last_state: None,
             last_poll: None,
@@ -138,8 +136,10 @@ impl DisplayPower {
         self.enabled = enabled;
         self.last_state = None;
         self.last_poll = None;
-        if enabled && !cfg!(test) && self.connectors.is_empty() {
-            self.connectors = enumerate_connectors(Path::new(DRM_CLASS_DIR));
+        if enabled {
+            if let Some(dir) = self.drm_dir.as_ref() {
+                self.connectors = enumerate_connectors(dir);
+            }
         }
     }
 
@@ -167,6 +167,9 @@ impl DisplayPower {
         }
         self.last_poll = Some(now);
         self.polls = self.polls.saturating_add(1);
+        if let Some(dir) = self.drm_dir.as_ref() {
+            self.connectors = enumerate_connectors(dir);
+        }
         let readings: Vec<ConnectorReading> =
             self.connectors.iter().map(|p| read_connector(p)).collect();
         let state = decide(&readings);
@@ -337,6 +340,32 @@ mod tests {
         let empty = std::env::temp_dir().join(format!("liuguang-dp-empty-{}", std::process::id()));
         let _ = fs::create_dir_all(&empty);
         assert!(enumerate_connectors(&empty).is_empty());
+        let _ = fs::remove_dir_all(&empty);
+
+        let dir = std::env::temp_dir().join(format!("liuguang-dp-dyn-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        let mut w = DisplayPower {
+            enabled: true,
+            drm_dir: Some(dir.clone()),
+            connectors: Vec::new(),
+            last_state: None,
+            last_poll: None,
+            polls: 0,
+            transitions: 0,
+        };
+        let t0 = Instant::now();
+        assert_eq!(w.refresh(t0), Some(ScreenState::On));
+        let conn = dir.join("card9-DP-1");
+        fs::create_dir_all(&conn).expect("mkdir conn");
+        fs::write(conn.join("status"), "connected\n").expect("status");
+        fs::write(conn.join("dpms"), "Off\n").expect("dpms");
+        assert_eq!(
+            w.refresh(t0 + SAMPLE_INTERVAL),
+            Some(ScreenState::Off),
+            "动态新增的连接器在下一次采样必须被枚举到"
+        );
+        let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&empty);
     }
 }

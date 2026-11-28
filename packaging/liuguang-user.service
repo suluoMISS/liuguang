@@ -79,6 +79,8 @@ ProtectSystem=strict
 # 桌面会话里要读用户自己目录下的图片/视频（媒体库），故 ProtectedHome 必须放开；
 # 若只想暴露壁纸目录，改用 BindPaths= 精确挂载。
 ProtectHome=read-only
+# 允许桌面模式按 XDG_CONFIG_HOME 写回 ~/.config/liuguang（前置 '-' 表示目录尚未存在时不报错）
+ReadWritePaths=-%E/liuguang
 # ProtectHome=read-only 把 $HOME 变成只读，而 CacheDirectory=liuguang 会由 systemd
 # 在首次启动前自动创建 $XDG_CACHE_HOME/liuguang 并赋权可写（避免目录尚不存在时
 # ReadWritePaths 触发 226/NAMESPACE 启动失败），同时媒体目录仍保持只读。

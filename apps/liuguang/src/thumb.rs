@@ -296,6 +296,11 @@ mod imp {
         let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
             .map_err(|e| format!("映射视频帧失败: {e}"))?;
         let (width, height) = (info.width(), info.height());
+        if width == 0 || height == 0 {
+            return Err("视频帧尺寸不能为 0".to_string());
+        }
+        liuguang_media::png_load::check_image_budget(width, height)
+            .map_err(|e| format!("视频帧尺寸超限: {e}"))?;
         let stride = info
             .stride()
             .first()
@@ -651,25 +656,44 @@ impl Service {
             self.counters.hits.fetch_add(1, Ordering::Relaxed);
             return Submit::Deferred(rx);
         }
-        // 磁盘缓存：读到就直接顶上（PNG 头里带尺寸）。
+        // 磁盘缓存：释放互斥锁后再读盘（带大小上限，防止大文件阻塞全池/OOM）。
         let path = self.dir.join(format!("{key}.png"));
-        if let Ok(bytes) = std::fs::read(&path) {
-            if let Some((width, height)) = png_dims(&bytes) {
-                let bytes = Arc::new(bytes);
-                state.mem.insert(
-                    key.clone(),
-                    MemEntry {
-                        bytes: Arc::clone(&bytes),
-                        width,
-                        height,
-                        used: stamp,
-                    },
-                );
-                self.counters.hits.fetch_add(1, Ordering::Relaxed);
-                evict(&mut state);
-                drop(state);
-                return Submit::Ready(ok_response(request_id, &media, &bytes, width, height));
-            }
+        drop(state);
+        let disk_bytes = read_cached_png(&path, MAX_THUMB_PNG_BYTES);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.stamp += 1;
+        let stamp = state.stamp;
+        if let Some(entry) = state.mem.get_mut(&key) {
+            entry.used = stamp;
+            self.counters.hits.fetch_add(1, Ordering::Relaxed);
+            let encoded = Arc::clone(&entry.bytes);
+            let (width, height) = (entry.width, entry.height);
+            drop(state);
+            return Submit::Ready(ok_response(request_id, &media, &encoded, width, height));
+        }
+        if let Some(waiters) = state.waiters.get_mut(&key) {
+            waiters.push(Waiter {
+                request_id: request_id.to_string(),
+                tx,
+            });
+            self.counters.hits.fetch_add(1, Ordering::Relaxed);
+            return Submit::Deferred(rx);
+        }
+        if let Some((bytes, width, height)) = disk_bytes {
+            let bytes = Arc::new(bytes);
+            state.mem.insert(
+                key.clone(),
+                MemEntry {
+                    bytes: Arc::clone(&bytes),
+                    width,
+                    height,
+                    used: stamp,
+                },
+            );
+            self.counters.hits.fetch_add(1, Ordering::Relaxed);
+            evict(&mut state);
+            drop(state);
+            return Submit::Ready(ok_response(request_id, &media, &bytes, width, height));
         }
         self.counters.misses.fetch_add(1, Ordering::Relaxed);
         if state.queue.len() + state.inflight.len() >= MAX_QUEUE {
@@ -750,8 +774,24 @@ fn worker_loop(
             }
         };
         let started = Instant::now();
-        let outcome = decode(&job.request).and_then(|thumb| {
-            let bytes = encode_png(&thumb.rgba, thumb.width, thumb.height)?;
+        let outcome = decode(&job.request).and_then(|mut thumb| {
+            let mut bytes = encode_png(&thumb.rgba, thumb.width, thumb.height)?;
+            for _ in 0..3 {
+                if bytes.len() <= MAX_THUMB_PNG_BYTES || (thumb.width <= 128 && thumb.height <= 128)
+                {
+                    break;
+                }
+                let next_w = (thumb.width * 3 / 4).max(1);
+                let next_h = (thumb.height * 3 / 4).max(1);
+                thumb = liuguang_media::thumbnail::scale_to_fit(thumb, next_w, next_h);
+                bytes = encode_png(&thumb.rgba, thumb.width, thumb.height)?;
+            }
+            if bytes.len() > MAX_THUMB_PNG_BYTES {
+                return Err(format!(
+                    "缩略图编码体积 {}B 超过 IPC 上限 {MAX_THUMB_PNG_BYTES}B",
+                    bytes.len()
+                ));
+            }
             Ok(Decoded {
                 bytes,
                 width: thumb.width,
@@ -922,13 +962,49 @@ fn png_dims(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
-/// 原子写缓存（`.part` → rename），失败只记日志（缓存丢失不影响正确性）。
+/// 单条缩略图 PNG 最大允许字节（保证 base64 + JSON 封装低于 1 MiB IPC 上限）。
+const MAX_THUMB_PNG_BYTES: usize = 700 * 1024;
+
+fn read_cached_png(path: &Path, limit: usize) -> Option<(Vec<u8>, u32, u32)> {
+    use std::io::Read as _;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() || meta.len() > limit as u64 {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(limit as u64 + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > limit {
+        return None;
+    }
+    let (w, h) = png_dims(&bytes)?;
+    Some((bytes, w, h))
+}
+
+/// 原子写缓存（`O_EXCL` 临时文件 → rename），失败清理临时文件。
 fn write_cache(dir: &Path, key: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{key}.png"));
-    let part = dir.join(format!("{key}.png.part"));
-    std::fs::write(&part, bytes)?;
-    std::fs::rename(&part, &path)
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let part = dir.join(format!(".{key}.{}.{seq}.png.part", std::process::id()));
+    let write_res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&part, &path)?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// 淘汰最久未用的条目，直到同时满足「条数」与「字节」两个上限。

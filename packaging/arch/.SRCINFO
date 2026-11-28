@@ -20,6 +20,7 @@ pkgbase = liuguang
 	depends = gstreamer
 	depends = gst-plugins-base
 	depends = gst-plugins-good
+	depends = gst-plugins-bad-libs
 	depends = gst-libav
 	depends = ffmpeg
 	depends = libva
@@ -27,5 +28,6 @@ pkgbase = liuguang
 	optdepends = intel-media-driver: Intel 核显的 VA-API 驱动（iHD）
 	optdepends = libva-nvidia-driver: NVIDIA 的 VA-API 驱动（NVDEC）
 	options = !lto
+	backup = etc/liuguang/config.toml
 
 pkgname = liuguang

@@ -382,7 +382,7 @@ impl<P: FrameProducer> VideoPlayer<P> {
         if !fps.is_finite() || fps <= 0.0 {
             return None;
         }
-        let min_gap = Duration::from_secs_f64(1.0 / fps);
+        let min_gap = Duration::try_from_secs_f64(1.0 / fps).ok()?;
         let gate = self.last_present_at?.checked_add(min_gap)?;
         // 上限**低于**源帧率时（用户调低 `video_fps_limit` 降载）门控是排程本身，
         // 不能因为"队首已到期"就放行——那会让上限失效（回归测试
@@ -523,8 +523,10 @@ impl<P: FrameProducer> VideoPlayer<P> {
             // 有 fps 门控 ⇒ 一个门周期内最多呈现一帧 ⇒ 更老的帧不可能被呈现。
             let age = match self.options.fps_limit {
                 Some(fps) if fps.is_finite() && fps > 0.0 => {
-                    let gate = Duration::from_secs_f64(1.0 / fps);
-                    self.options.drop_late_tolerance.min(gate)
+                    match Duration::try_from_secs_f64(1.0 / fps) {
+                        Ok(gate) => self.options.drop_late_tolerance.min(gate),
+                        Err(_) => self.options.drop_late_tolerance,
+                    }
                 }
                 _ => self.options.drop_late_tolerance,
             };

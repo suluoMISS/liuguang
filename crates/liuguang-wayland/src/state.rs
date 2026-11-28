@@ -6,9 +6,12 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
 
 use wayland_client::{
-    Connection, Dispatch, Proxy, QueueHandle,
+    Connection, Dispatch, Proxy, QueueHandle, WEnum,
     globals::GlobalListContents,
     protocol::{
         wl_buffer, wl_callback, wl_compositor, wl_output, wl_region, wl_registry, wl_shm,
@@ -20,6 +23,7 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
 };
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
+    zwp_linux_dmabuf_feedback_v1::{self, ZwpLinuxDmabufFeedbackV1},
     zwp_linux_dmabuf_v1::{self, ZwpLinuxDmabufV1},
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
@@ -49,9 +53,9 @@ pub(crate) struct SurfaceUdata(pub u32);
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LayerUdata(pub u32);
 
-/// `wl_callback`（frame 节拍）的用户数据。
+/// `wl_callback`（frame 节拍）的用户数据：`(global, frame_gen)`。
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct FrameUdata(pub u32);
+pub(crate) struct FrameUdata(pub u32, pub u64);
 
 /// `wl_buffer` 的用户数据：槽位回收路由。
 #[derive(Clone, Copy, Debug)]
@@ -73,7 +77,7 @@ pub(crate) struct FractionalUdata(pub u32);
 pub(crate) struct DmabufParamsUdata(pub u32);
 
 /// 合成器广播的一个「格式 + 支持的 modifier 列表」。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DmabufFormat {
     /// DRM fourcc（如 NV12 = 0x3231564E）。
     pub fourcc: u32,
@@ -82,12 +86,12 @@ pub(crate) struct DmabufFormat {
 }
 
 impl DmabufFormat {
-    /// 该格式是否可用于 `modifier`（`DRM_FORMAT_MOD_INVALID` = 隐式 modifier）。
+    /// 该格式是否可用于 `modifier`（仅当未广播显式 modifier 或显式包含 `MOD_INVALID` 时接受隐式）。
     pub(crate) fn accepts(&self, modifier: u64) -> bool {
         /// `DRM_FORMAT_MOD_INVALID`：表示"隐式 modifier"，等价于不指定。
         const MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
         if modifier == MOD_INVALID {
-            return true;
+            return self.modifiers.is_empty() || self.modifiers.contains(&MOD_INVALID);
         }
         // 线性布局：很多合成器只在格式事件里广播（不带 modifier 事件），
         // 此时 LINEAR 仍然可用。
@@ -115,7 +119,9 @@ pub(crate) struct OutputEntry {
     pub name: Option<String>,
     pub description: Option<String>,
     pub physical_mm: Option<(i32, i32)>,
+    pub transform: wl_output::Transform,
     pub scale: i32,
+    pub done: bool,
     /// Mode 事件累计（物理模式列表；合成器报告）。
     pub modes: Vec<liuguang_core::types::DisplayMode>,
     pub current_mode: Option<liuguang_core::types::DisplayMode>,
@@ -142,18 +148,70 @@ pub(crate) struct OutputEntry {
     pub frame_pool: Option<Pool>,
     /// 上一帧 commit 后是否还在等 frame 回调（单帧 in-flight 背压）。
     pub frame_pending: bool,
+    /// 当前追踪的 `wl_surface.frame` 回调及其代次。
+    pub frame_callback: Option<(u64, wl_callback::WlCallback)>,
+    /// 单调递减/递增代次，用于忽略过期 `frame_callback` 事件。
+    pub frame_gen: u64,
+    /// layer surface 被合成器 `Closed`，需要按需重建（`wl_output` 仍活着）。
+    pub needs_recreate: bool,
+    /// 尺寸/缩放/旋转变化，需要重绘标志。
+    pub needs_repaint: bool,
     /// 已提交帧计数（PresentToken.sequence 递增源）。
     pub sequence: u64,
-    /// 全局被移除 / surface Closed → true；此后输出不再可见。
+    /// 全局被移除 → true。
     pub dead: bool,
 }
 
 impl OutputEntry {
+    pub(crate) fn new(global: u32, output: wl_output::WlOutput) -> Self {
+        Self {
+            global,
+            output,
+            name: None,
+            description: None,
+            physical_mm: None,
+            transform: wl_output::Transform::Normal,
+            scale: 1,
+            done: false,
+            modes: Vec::new(),
+            current_mode: None,
+            preferred_mode: None,
+            surface: None,
+            layer: None,
+            viewport: None,
+            fractional: None,
+            fractional_factor: None,
+            cfg: None,
+            pending_configure: None,
+            pool: None,
+            frame_pool: None,
+            frame_pending: false,
+            frame_callback: None,
+            frame_gen: 0,
+            needs_recreate: false,
+            needs_repaint: false,
+            sequence: 0,
+            dead: false,
+        }
+    }
+
     /// 输出键：优先 `wl_output.name`，否则 `output-<global>`。
     pub(crate) fn key(&self) -> String {
         self.name
             .clone()
             .unwrap_or_else(|| format!("output-{}", self.global))
+    }
+
+    /// 按 `wl_output.transform` 旋转后的有效逻辑/显示模式尺寸（90°/270° 交换宽高）。
+    pub(crate) fn effective_mode_dims(&self) -> Option<(u32, u32)> {
+        let mode = self.current_mode.or(self.preferred_mode)?;
+        Some(match self.transform {
+            wl_output::Transform::_90
+            | wl_output::Transform::_270
+            | wl_output::Transform::Flipped90
+            | wl_output::Transform::Flipped270 => (mode.height, mode.width),
+            _ => (mode.width, mode.height),
+        })
     }
 
     /// 合成器建议的缩放是否可用（fractional 协议在位且已收到 factor）。
@@ -234,6 +292,100 @@ fn destroy_scale_objects(entry: &mut OutputEntry) {
         }
     }
     entry.fractional_factor = None;
+}
+
+/// 销毁某个输出关联的 surface/layer/scale/pool/frame_callback 资源（输出移除或 Closed 共用）。
+pub(crate) fn destroy_output_surface_resources(entry: &mut OutputEntry) {
+    entry.frame_callback.take();
+    entry.frame_gen = entry.frame_gen.wrapping_add(1);
+    entry.frame_pending = false;
+    destroy_scale_objects(entry);
+    if let Some(layer) = entry.layer.take() {
+        if layer.is_alive() {
+            layer.destroy();
+        }
+    }
+    if let Some(surface) = entry.surface.take() {
+        if surface.is_alive() {
+            surface.destroy();
+        }
+    }
+    entry.pool = None;
+    entry.frame_pool = None;
+    entry.cfg = None;
+    entry.pending_configure = None;
+}
+
+/// 释放属于特定输出的 DMA-BUF keepalive，防止热插拔/surface 重建后解码表面池泄漏。
+pub(crate) fn release_output_dmabuf_keepalives(state: &mut WlState, global: u32) {
+    let stale_ids: Vec<_> = state
+        .dmabuf_buffer_output
+        .iter()
+        .filter(|&(_, owner)| *owner == global)
+        .map(|(buf_id, _)| buf_id.clone())
+        .collect();
+    for buf_id in stale_ids {
+        state.dmabuf_buffer_output.remove(&buf_id);
+        state.dmabuf_buffer_keepalive.remove(&buf_id);
+        if let Some(serial) = state.dmabuf_buffer_serial.remove(&buf_id) {
+            state.dmabuf_keepalives.remove(&serial);
+        }
+    }
+}
+
+fn merge_dmabuf_pair(list: &mut Vec<DmabufFormat>, fourcc: u32, modifier: u64) {
+    match list.iter_mut().find(|f| f.fourcc == fourcc) {
+        Some(entry) => {
+            if !entry.modifiers.contains(&modifier) {
+                entry.modifiers.push(modifier);
+            }
+        }
+        None => list.push(DmabufFormat {
+            fourcc,
+            modifiers: vec![modifier],
+        }),
+    }
+}
+
+/// 将 `zwp_linux_dmabuf_feedback_v1` 下发的 DRM `dev_t` 字节数组解析为 `/dev/dri/renderD*`。
+pub(crate) fn resolve_drm_render_node_from_dev_t(bytes: &[u8]) -> Option<PathBuf> {
+    let dev_id = match bytes.len() {
+        8 => u64::from_ne_bytes(bytes.try_into().ok()?),
+        4 => u64::from(u32::from_ne_bytes(bytes.try_into().ok()?)),
+        _ => return None,
+    };
+    let entries = std::fs::read_dir("/dev/dri").ok()?;
+    let mut matched_card: Option<String> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.rdev() == dev_id {
+            if name.starts_with("renderD") {
+                return Some(path);
+            }
+            if name.starts_with("card") {
+                matched_card = Some(name.to_string());
+            }
+        }
+    }
+    let card_name = matched_card?;
+    let sys_drm = PathBuf::from(format!("/sys/class/drm/{card_name}/device/drm"));
+    for entry in std::fs::read_dir(sys_drm).ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("renderD") {
+            let candidate = PathBuf::from(format!("/dev/dri/{name}"));
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +474,18 @@ pub(crate) struct WlState {
     pub shm_formats: Vec<wl_shm::Format>,
     /// `zwp_linux_dmabuf_v1`（可选全局；不在位则零拷贝路径不可用）。
     pub dmabuf: Option<ZwpLinuxDmabufV1>,
+    /// v4 默认 feedback（`get_default_feedback`），收到 `done` 后原子替换 `dmabuf_formats`。
+    pub dmabuf_feedback: Option<ZwpLinuxDmabufFeedbackV1>,
+    /// v4 `format_table` 内存表快照。
+    pub dmabuf_feedback_table: Vec<(u32, u64)>,
+    /// v4 在一个反馈事务内累积的格式+modifier，等 `done` 一次性生效。
+    pub dmabuf_pending_formats: Vec<DmabufFormat>,
+    /// v4 在一个反馈事务内收到的 `main_device` 对应 render 节点。
+    pub dmabuf_pending_main_device: Option<PathBuf>,
+    /// 最近一次已生效的 `main_device` 渲染节点。
+    pub dmabuf_main_device: Option<PathBuf>,
+    /// 是否已完成至少一轮 v4 feedback `done`。
+    pub dmabuf_feedback_done: bool,
     /// 合成器广播的 `格式 + modifier` 表（DMA-BUF 导入前必须校验）。
     pub dmabuf_formats: Vec<DmabufFormat>,
     /// 最近一次 `zwp_linux_buffer_params_v1` 导入结果：
@@ -339,13 +503,10 @@ pub(crate) struct WlState {
     /// `wl_buffer` 对象 → 寿命延长器（`create_immed` 路径专用，没有导入序号可用）。
     pub dmabuf_buffer_keepalive:
         std::collections::HashMap<wayland_client::backend::ObjectId, FrameKeepalive>,
-    /// 已经**异步导入成功过**的 `(fourcc, modifier)`：只有它们才允许走 `create_immed`。
-    ///
-    /// `zwp_linux_buffer_params_v1.create_immed`（since 2）同步返回 `wl_buffer`，省掉
-    /// "发 create → 等 created 事件"那次往返；代价是失败不再是 `failed` 事件，而是
-    /// **协议错误**（直接断连接）。所以先用异步路径验证一次同一组格式真的能导入，
-    /// 之后才敢走同步路径——见 `present_dmabuf_fitted` 的注释。
-    pub dmabuf_warm: std::collections::HashSet<(u32, u64)>,
+    /// `wl_buffer` 对象 → 所属输出 global（输出销毁/Closed 时立刻归还解码表面）。
+    pub dmabuf_buffer_output: std::collections::HashMap<wayland_client::backend::ObjectId, u32>,
+    /// 已经**异步导入成功过**的 `(fourcc, modifier, width, height, plane_count, object_count)`。
+    pub dmabuf_warm: std::collections::HashSet<(u32, u64, u32, u32, u32, usize)>,
     /// global 名 → 输出条目。
     pub outputs: HashMap<u32, OutputEntry>,
     /// `zwlr_foreign_toplevel_manager_v1`（可选；niri/sway 有，GNOME/KDE 没有）。
@@ -448,54 +609,17 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WlState {
                     // 新输出热插：绑定 min(版本, 4)（name/description 需要 v4）。
                     let v = version.min(4);
                     let output: wl_output::WlOutput = registry.bind(name, v, qh, OutputUdata(name));
-                    state.outputs.insert(
-                        name,
-                        OutputEntry {
-                            global: name,
-                            output,
-                            name: None,
-                            description: None,
-                            physical_mm: None,
-                            scale: 1,
-                            modes: Vec::new(),
-                            current_mode: None,
-                            preferred_mode: None,
-                            surface: None,
-                            layer: None,
-                            viewport: None,
-                            fractional: None,
-                            fractional_factor: None,
-                            cfg: None,
-                            pending_configure: None,
-                            pool: None,
-                            frame_pool: None,
-                            frame_pending: false,
-                            sequence: 0,
-                            dead: false,
-                        },
-                    );
+                    state.outputs.insert(name, OutputEntry::new(name, output));
                 }
             }
             wl_registry::Event::GlobalRemove { name } => {
-                if let Some(entry) = state.outputs.get_mut(&name) {
+                if let Some(mut entry) = state.outputs.remove(&name) {
                     entry.dead = true;
-                    // 显式销毁已建资源（代理 Drop 不发 destructor）。
-                    destroy_scale_objects(entry);
-                    if let Some(layer) = entry.layer.take() {
-                        if layer.is_alive() {
-                            layer.destroy();
-                        }
-                    }
-                    if let Some(surface) = entry.surface.take() {
-                        if surface.is_alive() {
-                            surface.destroy();
-                        }
-                    }
-                    entry.pool = None; // Pool Drop 自行 destroy+munmap
-                    entry.frame_pool = None;
+                    destroy_output_surface_resources(&mut entry);
                     if entry.output.is_alive() && entry.output.version() >= 3 {
                         entry.output.release();
                     }
+                    release_output_dmabuf_keepalives(state, name);
                 }
             }
             _ => {}
@@ -624,8 +748,9 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, FractionalUdata> for 
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
             if let Some(entry) = state.outputs.get_mut(&udata.0) {
                 // 分母固定 120（1.5 → 180）；0 是非法值，忽略而非采纳。
-                if scale > 0 {
+                if scale > 0 && entry.fractional_factor != Some(scale) {
                     entry.fractional_factor = Some(scale);
+                    entry.needs_repaint = true;
                 }
             }
         }
@@ -652,9 +777,16 @@ impl Dispatch<wl_output::WlOutput, OutputUdata> for WlState {
             wl_output::Event::Geometry {
                 physical_width,
                 physical_height,
+                transform,
                 ..
             } => {
                 entry.physical_mm = Some((physical_width, physical_height));
+                if let WEnum::Value(t) = transform {
+                    if entry.transform != t {
+                        entry.transform = t;
+                        entry.needs_repaint = true;
+                    }
+                }
             }
             wl_output::Event::Mode {
                 flags,
@@ -666,7 +798,6 @@ impl Dispatch<wl_output::WlOutput, OutputUdata> for WlState {
                 // 置位（niri 实测 current|preferred = 3）。**必须测位，不能比相等**：
                 // 比相等会把 3 != 1 判成"不是当前模式"，`current_mode` 永远空，
                 // 上层 `resolve_mode(Preferred)` 就会报"合成器尚未报告模式"。
-                use wayland_client::WEnum;
                 let mode = liuguang_core::types::DisplayMode {
                     width: width as u32,
                     height: height as u32,
@@ -684,16 +815,24 @@ impl Dispatch<wl_output::WlOutput, OutputUdata> for WlState {
                 } else if preferred && entry.preferred_mode.is_none() {
                     entry.preferred_mode = Some(mode);
                 }
-                entry.modes.push(mode);
+                if !entry.modes.contains(&mode) {
+                    entry.modes.push(mode);
+                }
             }
             wl_output::Event::Scale { factor } => {
-                entry.scale = factor;
+                if entry.scale != factor {
+                    entry.scale = factor;
+                    entry.needs_repaint = true;
+                }
             }
             wl_output::Event::Name { name } => {
                 entry.name = Some(name);
             }
             wl_output::Event::Description { description } => {
                 entry.description = Some(description);
+            }
+            wl_output::Event::Done => {
+                entry.done = true;
             }
             _ => {}
         }
@@ -725,20 +864,10 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, LayerUdata> for WlState
                 entry.pending_configure = Some((serial, width, height));
             }
             zwlr_layer_surface_v1::Event::Closed => {
-                entry.dead = true;
-                destroy_scale_objects(entry);
-                if let Some(layer) = entry.layer.take() {
-                    if layer.is_alive() {
-                        layer.destroy();
-                    }
-                }
-                if let Some(surface) = entry.surface.take() {
-                    if surface.is_alive() {
-                        surface.destroy();
-                    }
-                }
-                entry.pool = None;
-                entry.frame_pool = None;
+                destroy_output_surface_resources(entry);
+                entry.needs_recreate = true;
+                entry.needs_repaint = true;
+                release_output_dmabuf_keepalives(state, udata.0);
             }
             _ => {}
         }
@@ -766,9 +895,12 @@ impl Dispatch<wl_callback::WlCallback, FrameUdata> for WlState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // frame 回调到达 = 上一次 commit 已被合成器消费 → 解除背压。
+        // 仅当回调函数属于当前最新一代提交时解除背压，忽略过期或已销毁回调的晚到事件。
         if let Some(entry) = state.outputs.get_mut(&udata.0) {
-            entry.frame_pending = false;
+            if entry.frame_gen == udata.1 {
+                entry.frame_pending = false;
+                entry.frame_callback.take();
+            }
         }
     }
 }
@@ -818,7 +950,7 @@ impl Dispatch<ZwpLinuxDmabufV1, ()> for WlState {
         _qhandle: &QueueHandle<Self>,
     ) {
         match event {
-            // v1–v3 的格式广播（v4+ 改为 feedback 对象，我们只绑到 v3）。
+            // v1–v3 的格式广播（v4+ 改走 feedback 对象）。
             zwp_linux_dmabuf_v1::Event::Format { format } => {
                 if !state.dmabuf_formats.iter().any(|f| f.fourcc == format) {
                     state.dmabuf_formats.push(DmabufFormat {
@@ -834,17 +966,58 @@ impl Dispatch<ZwpLinuxDmabufV1, ()> for WlState {
                 modifier_lo,
             } => {
                 let modifier = (u64::from(modifier_hi) << 32) | u64::from(modifier_lo);
-                match state.dmabuf_formats.iter_mut().find(|f| f.fourcc == format) {
-                    Some(entry) => {
-                        if !entry.modifiers.contains(&modifier) {
-                            entry.modifiers.push(modifier);
-                        }
+                merge_dmabuf_pair(&mut state.dmabuf_formats, format, modifier);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwpLinuxDmabufFeedbackV1, ()> for WlState {
+    fn event(
+        state: &mut Self,
+        _: &ZwpLinuxDmabufFeedbackV1,
+        event: zwp_linux_dmabuf_feedback_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_linux_dmabuf_feedback_v1::Event::FormatTable { fd, size } => {
+                match crate::sys::read_dmabuf_format_table(fd.as_raw_fd(), size as usize) {
+                    Ok(table) => {
+                        state.dmabuf_feedback_table = table;
                     }
-                    None => state.dmabuf_formats.push(DmabufFormat {
-                        fourcc: format,
-                        modifiers: vec![modifier],
-                    }),
+                    Err(e) => {
+                        tracing::warn!(error = %e, size, "读取 DMA-BUF v4 format_table 失败");
+                        state.dmabuf_feedback_table.clear();
+                    }
                 }
+                state.dmabuf_pending_formats.clear();
+            }
+            zwp_linux_dmabuf_feedback_v1::Event::MainDevice { device } => {
+                state.dmabuf_pending_main_device = resolve_drm_render_node_from_dev_t(&device);
+            }
+            zwp_linux_dmabuf_feedback_v1::Event::TrancheFormats { indices } => {
+                for chunk in indices.chunks_exact(2) {
+                    let idx = u16::from_ne_bytes([chunk[0], chunk[1]]) as usize;
+                    if let Some(&(fourcc, modifier)) = state.dmabuf_feedback_table.get(idx) {
+                        merge_dmabuf_pair(&mut state.dmabuf_pending_formats, fourcc, modifier);
+                    }
+                }
+            }
+            zwp_linux_dmabuf_feedback_v1::Event::Done => {
+                let next_formats = std::mem::take(&mut state.dmabuf_pending_formats);
+                if !next_formats.is_empty() {
+                    if state.dmabuf_formats != next_formats {
+                        state.dmabuf_warm.clear();
+                    }
+                    state.dmabuf_formats = next_formats;
+                }
+                if let Some(dev) = state.dmabuf_pending_main_device.take() {
+                    state.dmabuf_main_device = Some(dev);
+                }
+                state.dmabuf_feedback_done = true;
             }
             _ => {}
         }
@@ -903,6 +1076,7 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for WlState {
             if let Some(serial) = state.dmabuf_buffer_serial.remove(&proxy.id()) {
                 state.dmabuf_keepalives.remove(&serial);
             }
+            state.dmabuf_buffer_output.remove(&proxy.id());
             let released_immed = state.dmabuf_buffer_keepalive.remove(&proxy.id()).is_some();
             tracing::trace!(
                 buffer = ?proxy.id(),
@@ -1116,6 +1290,8 @@ mod tests {
             modifiers: vec![0x0100_0000_0000_0002],
         };
         assert!(tiled.accepts(0x0100_0000_0000_0002));
+        // 广播了显式 modifier 且未列 MOD_INVALID 时，不允许悄悄落回隐式 modifier。
+        assert!(!tiled.accepts(MOD_INVALID));
         // 广播了 modifier 列表后 LINEAR 仍需显式列出，否则拒绝。
         assert!(!tiled.accepts(0));
     }

@@ -467,7 +467,8 @@ pub fn build(app: &Rc<App>) -> Rc<DetailsView> {
         let app = Rc::downgrade(app);
         view.prepare.connect_clicked(move |_| {
             if let Some(app) = app.upgrade() {
-                if let Some(id) = app.state.borrow().selected.clone() {
+                let selected = app.state.borrow().selected.clone();
+                if let Some(id) = selected {
                     app.prepare_media(&id);
                 }
             }
@@ -479,7 +480,8 @@ pub fn build(app: &Rc<App>) -> Rc<DetailsView> {
         let app = Rc::downgrade(app);
         view.apply.connect_clicked(move |_| {
             if let Some(app) = app.upgrade() {
-                if let Some(id) = app.state.borrow().selected.clone() {
+                let selected = app.state.borrow().selected.clone();
+                if let Some(id) = selected {
                     app.apply_media(&id, false);
                 }
             }
@@ -489,7 +491,8 @@ pub fn build(app: &Rc<App>) -> Rc<DetailsView> {
         let app = Rc::downgrade(app);
         view.favorite.connect_clicked(move |_| {
             if let Some(app) = app.upgrade() {
-                if let Some(id) = app.state.borrow().selected.clone() {
+                let selected = app.state.borrow().selected.clone();
+                if let Some(id) = selected {
                     app.toggle_favorite(&id);
                 }
             }
@@ -620,12 +623,12 @@ pub fn sync_outputs(app: &Rc<App>, view: &Rc<DetailsView>) {
     *view.output_ids.borrow_mut() = ids;
     view.output.set_model(Some(&gtk::StringList::new(&strings)));
     if let Some(current) = current {
-        if let Some(index) = view
+        let matched = view
             .output_ids
             .borrow()
             .iter()
-            .position(|id| id.as_deref() == Some(current.as_str()))
-        {
+            .position(|id| id.as_deref() == Some(current.as_str()));
+        if let Some(index) = matched {
             view.output.set_selected(u32::try_from(index).unwrap_or(0));
         }
     }

@@ -1119,19 +1119,23 @@ fn over_button(target: &gtk::Widget, x: f64, y: f64) -> bool {
 pub fn bind_hover(app: &Rc<App>, card: &Rc<Card>, overlay: &gtk::Overlay) {
     let motion = gtk::EventControllerMotion::new();
     let app_enter = Rc::downgrade(app);
-    let card_enter = card.clone();
+    let card_enter = Rc::downgrade(card);
     motion.connect_enter(move |_, _, _| {
-        let Some(app) = app_enter.upgrade() else {
+        let (Some(app), Some(card)) = (app_enter.upgrade(), card_enter.upgrade()) else {
             return;
         };
-        schedule_hover(&app, &card_enter);
+        schedule_hover(&app, &card);
     });
     let app_leave = Rc::downgrade(app);
-    let card_leave = card.clone();
+    let card_leave = Rc::downgrade(card);
     motion.connect_leave(move |_| {
-        cancel_hover(app_leave.upgrade().as_ref(), &card_leave);
-        if let Some(app) = app_leave.upgrade() {
-            restore_cover(&app, &card_leave);
+        let app_up = app_leave.upgrade();
+        let Some(card) = card_leave.upgrade() else {
+            return;
+        };
+        cancel_hover(app_up.as_ref(), &card);
+        if let Some(app) = app_up {
+            restore_cover(&app, &card);
         }
     });
     overlay.add_controller(motion);
@@ -1360,8 +1364,7 @@ fn show_menu(app: &Rc<App>, id: &str, anchor: &gtk::Widget) {
     }
     popover.set_child(Some(&menu));
 
-    let popover3 = popover.clone();
-    popover.connect_closed(move |_| popover3.unparent());
+    popover.connect_closed(|p| p.unparent());
     popover.set_parent(anchor);
     popover.popup();
 }
