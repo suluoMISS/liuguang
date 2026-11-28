@@ -1,13 +1,15 @@
 name: ci
 
-# 门禁 = 默认构型 + **feature 矩阵**。
+# 门禁分两个 job：
+#   - checks：默认构型 + **feature 矩阵**；
+#   - gui：`apps/liuguang-gui` 独立 workspace（GTK4）。
 #
-# 为什么把 feature 矩阵放进同一个 job 且不可跳过：`gstreamer`（视频）与
-# `gles`（GPU 转场）都是**非默认** feature，不带 `--features` 的
-# `cargo test/clippy --workspace` 不会编译它们。
+# 为什么 feature 矩阵不可跳过：`gstreamer`（视频）与 `gles`（GPU 转场）都是
+# **非默认** feature，不带 `--features` 的 `cargo test/clippy --workspace` 不会
+# 编译它们；两个阶段各自打印明确结论，不允许把前者当作整体通过。
 #
-# 两个阶段各自打印明确结论（默认 feature 全绿 / 矩阵阶段完成），
-# 不允许把前者当作整体通过。
+# 为什么 GUI 单独一个 job：GUI 是需要 GTK4 系统开发包的独立 workspace，与
+# 守护进程/CLI 分离，保证后者在没有 GTK 的服务器上也能构建。
 
 on:
   push:
@@ -74,3 +76,38 @@ jobs:
           cargo clippy -p liuguang-render --features gles --all-targets -- -D warnings
       - name: 阶段 B — 结论
         run: echo "✅ feature 矩阵全绿（gstreamer + gles）"
+
+  # GUI 独立 workspace：`apps/liuguang-gui/Cargo.toml` 里自带空的 [workspace]，
+  # 根 workspace 的 fmt/clippy/test 不会覆盖它，因此单独跑一遍。
+  gui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/liuguang-gui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # gtk4 的 v4_12 特性要求 GTK ≥ 4.12，libadwaita 的 v1_5 要求 ≥ 1.5
+      # （ubuntu-24.04 runner 分别是 4.14 / 1.5）。
+      # xvfb 只服务 `cargo test`：GUI 测试会真的构造 GTK 控件与纹理，
+      # 无显示服务器的 runner 上需要一块虚拟 X 屏。
+      - name: 安装 GTK4 依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libgdk-pixbuf-2.0-dev \
+            xvfb
+      - name: GUI — fmt
+        run: cargo fmt --check
+      - name: GUI — clippy（-D warnings）
+        run: cargo clippy --all-targets -- -D warnings
+      - name: GUI — test（xvfb）
+        run: xvfb-run -a cargo test
+      - name: GUI — 结论
+        run: echo "✅ GUI 独立 workspace 全绿（fmt + clippy + test）"
