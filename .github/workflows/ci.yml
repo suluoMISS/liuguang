@@ -22,6 +22,31 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # 构建依赖：阶段 A 的 `cargo clippy --workspace --all-targets` 会编译
+      # workspace 成员 liuguang-vaapi（非可选），它又牵连：
+      #   - liuguang-media/gstreamer（非可选 feature）→ glib/gobject/gio + GStreamer 各 -dev
+      #   - gbm（GBM 设备 + EGL）→ libgbm.so
+      #   - liuguang-vaapi/build.rs 的 pkg-config 探测与 dlopen 链接 → libva / libav* / libdrm
+      #   - gbm 的 wayland-server 依赖 → wayland-server.pc
+      # 缺任一 -dev 包都会在 glib-sys / gbm-sys / build.rs 处直接失败（公开 main
+      # 此前的 run 就挂在 `glib-2.0 was not found in the pkg-config search path`）。
+      # GUI 是独立 workspace（apps/liuguang-gui），本 job 不编译，故不装 GTK4。
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libglib2.0-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgbm-dev \
+            libwayland-dev \
+            libdrm-dev \
+            libva-dev \
+            libavformat-dev \
+            libavcodec-dev \
+            libavutil-dev
+
       # 阶段 A：默认 feature 构型
       - name: 阶段 A — fmt
         run: cargo fmt --check
