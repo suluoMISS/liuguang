@@ -172,3 +172,118 @@ pub(crate) fn peer_pid(fd: RawFd) -> Option<u32> {
         None
     }
 }
+
+/// 系统页大小（至少 4096 字节），用于对齐 memfd 打洞区间防止跨槽误清。
+fn page_size() -> usize {
+    static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGE_SIZE.get_or_init(|| {
+        // SAFETY: `sysconf(_SC_PAGESIZE)` 无指针入参、无全局副作用。
+        let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        usize::try_from(raw)
+            .ok()
+            .filter(|&n| n >= 4096 && n.is_power_of_two())
+            .unwrap_or(4096)
+    })
+}
+
+/// 将 memfd 区间 `[offset, offset + len)` 内**严格对齐在边界内侧**的整页归还给内核
+/// （`fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`），保留文件大小与映射地址不变。
+///
+/// 注意：为防止越界清零相邻槽位，区间会向内收缩到页边界——因此非页对齐槽位仅回收槽内的
+/// 页对齐中段；若槽位跨越不到一个完整页（如极小缓冲或 `aligned_end <= aligned_start`），
+/// 回收量为 0 并安全返回 `Ok(())`。
+pub(crate) fn punch_hole_range(fd: RawFd, offset: usize, len: usize) -> io::Result<()> {
+    let Some(end) = offset.checked_add(len) else {
+        return Ok(());
+    };
+    let page = page_size();
+    let aligned_start = offset.next_multiple_of(page);
+    let aligned_end = end - (end % page);
+    if aligned_end <= aligned_start {
+        return Ok(());
+    }
+    let aligned_len = aligned_end - aligned_start;
+    // SAFETY: `fd` 为调用方 `Pool` 持有的有效 memfd；`aligned_start..aligned_end` 严格落在该槽位内部，
+    // 绝不会越界清零相邻槽位像素。
+    let rc = unsafe {
+        libc::fallocate(
+            fd,
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            aligned_start as libc::off_t,
+            aligned_len as libc::off_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn punch_hole_range_clears_inner_aligned_pages_without_touching_neighbors() {
+        let page = page_size();
+        // 刻意采用非页对齐槽位，但确保槽 1 内部至少包含一个完整整页以便真正触发打洞回收。
+        let slot_bytes = page * 2 + 1368;
+        let total = slot_bytes * 3;
+        let fd = memfd_owned(b"liuguang-hole-test\0").unwrap();
+        ftruncate(fd.as_raw_fd(), total).unwrap();
+        let ptr = mmap_shared_rw(fd.as_raw_fd(), total).unwrap();
+        // SAFETY: `ptr..ptr+total` 独占映射，测试结束后 munmap。
+        unsafe {
+            let buf = slice_mut(ptr, total);
+            buf.fill(0xAA);
+            punch_hole_range(fd.as_raw_fd(), slot_bytes, slot_bytes).unwrap();
+            let mid_start = slot_bytes.next_multiple_of(page);
+            let mid_end = (slot_bytes * 2) - ((slot_bytes * 2) % page);
+            assert!(
+                mid_end > mid_start,
+                "测试槽位必须包含至少一个完整页以验证打洞生效"
+            );
+            assert!(
+                buf[..mid_start].iter().all(|&b| b == 0xAA),
+                "槽 0 及槽 1 头部非对齐区不得被邻槽打洞破坏"
+            );
+            assert!(
+                buf[mid_start..mid_end].iter().all(|&b| b == 0),
+                "槽 1 中间页对齐部分应已被内核清零"
+            );
+            assert!(
+                buf[mid_end..].iter().all(|&b| b == 0xAA),
+                "槽 1 尾部非对齐区及槽 2 不得被邻槽打洞破坏"
+            );
+            munmap(ptr, total);
+        }
+    }
+
+    #[test]
+    fn punch_hole_range_is_safe_noop_when_slot_spans_no_full_page() {
+        let page = page_size();
+        // 类似 1366x1x4 这类非对齐且跨度不足一个完整内缩页的区间：内缩后为空，回收量为 0。
+        let slot_bytes = page + 1368;
+        let mid_start = slot_bytes.next_multiple_of(page);
+        let mid_end = (slot_bytes * 2) - ((slot_bytes * 2) % page);
+        assert!(mid_end <= mid_start);
+
+        let total = slot_bytes * 3;
+        let fd = memfd_owned(b"liuguang-hole-noop-test\0").unwrap();
+        ftruncate(fd.as_raw_fd(), total).unwrap();
+        let ptr = mmap_shared_rw(fd.as_raw_fd(), total).unwrap();
+        // SAFETY: `ptr..ptr+total` 独占映射，测试结束后 munmap。
+        unsafe {
+            let buf = slice_mut(ptr, total);
+            buf.fill(0xAA);
+            punch_hole_range(fd.as_raw_fd(), slot_bytes, slot_bytes).unwrap();
+            assert!(
+                buf.iter().all(|&b| b == 0xAA),
+                "无完整内缩页时应为安全空操作，不得修改任何字节"
+            );
+            munmap(ptr, total);
+        }
+    }
+}

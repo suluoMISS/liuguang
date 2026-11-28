@@ -164,11 +164,25 @@ impl From<FitArg> for FitMode {
 ///
 /// `main.rs` 只调用它一次，真正的逻辑留在这里以便单测直接覆盖。
 pub fn main_entry() -> ExitCode {
-    let cli = Cli::parse();
-    init_tracing();
+    thumb::configure_allocator();
     // 新前缀优先：`LIUGUANG_FOO` 视同 `LIUGUANG_FOO`（仅在后者未设置时复制）。
     // 这样文档里可以写 liuguang 前缀，而内部 40+ 处读取不必逐个改。
     alias_env_prefix();
+    match std::env::args_os()
+        .nth(1)
+        .and_then(|s| s.into_string().ok())
+        .as_deref()
+    {
+        Some(thumb::INTERNAL_THUMB_WORKER_ARG) => {
+            return ExitCode::from(thumb::run_internal_worker_main());
+        }
+        Some(compat::INTERNAL_PROBE_VAAPI_ARG) => {
+            return ExitCode::from(compat::run_internal_vaapi_probe());
+        }
+        _ => {}
+    }
+    let cli = Cli::parse();
+    init_tracing();
     match run(cli) {
         Ok(()) => ExitCode::from(EXIT_OK),
         Err(message) => {

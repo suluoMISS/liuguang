@@ -16,6 +16,7 @@
 
 let
   gstPlugins = with gst_all_1; [
+    gstreamer
     gst-plugins-base
     gst-plugins-good
     gst-plugins-bad
@@ -79,9 +80,12 @@ rustPlatform.buildRustPackage {
     install -Dm0644 -t $out/share/doc/liuguang docs/*.md
   '';
 
-  # GStreamer 插件与 EGL/GBM 都是运行期加载的。
+  # GStreamer 插件与 EGL/GBM 都是运行期加载的，并设置 glibc malloc 默认阈值以抑制线程 arena 与未收缩堆导致的 RSS 膨胀。
   postFixup = ''
     wrapProgram $out/bin/liuguang \
+      --set-default MALLOC_ARENA_MAX 2 \
+      --set-default MALLOC_MMAP_THRESHOLD_ 131072 \
+      --set-default MALLOC_TRIM_THRESHOLD_ 65536 \
       --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : "${
         lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" gstPlugins
       }" \
