@@ -30,6 +30,8 @@ jobs:
       #   - gbm 的 wayland-server 依赖 → wayland-server.pc
       # 缺任一 -dev 包都会在 glib-sys / gbm-sys / build.rs 处直接失败（公开 main
       # 此前的 run 就挂在 `glib-2.0 was not found in the pkg-config search path`）。
+      # `gstreamer1.0-vaapi` 必须装运行时包：liuguang-media/build.rs 用
+      # `-l:libgstva-1.0.so.0` 按精确文件名链接（没有 -devel 的 `.so` 符号链接）。
       # GUI 是独立 workspace（apps/liuguang-gui），本 job 不编译，故不装 GTK4。
       - name: 安装系统依赖
         run: |
@@ -45,7 +47,9 @@ jobs:
             libva-dev \
             libavformat-dev \
             libavcodec-dev \
-            libavutil-dev
+            libavutil-dev \
+            gstreamer1.0-vaapi \
+            gstreamer1.0-plugins-base
 
       # 阶段 A：默认 feature 构型
       - name: 阶段 A — fmt
